@@ -1,0 +1,17 @@
+[project]
+name = "koyomi"
+version = "0.1.0"
+description = "Tiny local job scheduler with plain-JSON state in ~/.koyomi"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+koyomi = "koyomi:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["koyomi"]
