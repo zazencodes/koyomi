@@ -20,13 +20,38 @@ koyomi add remind --in 2h --cmd "say stretch"
 koyomi list                # jobs, next run, last result
 koyomi show sync           # details and upcoming run times
 koyomi run sync            # run now
+koyomi stop sync           # interrupt the active run
 koyomi logs sync           # output of the latest run
 koyomi history --failed    # past runs
 koyomi status              # scheduler health and failing jobs
+koyomi tui                 # live terminal dashboard
 koyomi disable sync        # or: enable, update, delete
 ```
 
 If a job was due while the Mac was asleep or off, it runs once when Koyomi comes back. Use `--catchup skip` to skip it instead. A job never runs twice for the same slot, and never overlaps itself.
+
+## Terminal dashboard
+
+`koyomi tui` opens a live dashboard: scheduler health, every job's state, next run, and last outcome. It reads the same JSON files as the CLI and reloads once a second (`--refresh SECONDS`).
+
+| key | action |
+| --- | --- |
+| `j`/`k`, `↑`/`↓`, `g`/`G`, PgUp/PgDn | move the selection |
+| `Enter` | toggle the detail pane (command, cwd, options, last run) |
+| `e` | enable / disable (an active run keeps going) |
+| `r` | run now, in the background |
+| `x` | stop the active run (asks first) |
+| `d` | delete the job and its history (asks first) |
+| `l` / `h` | log of the latest run (live-follows) / run history |
+| `D` | scheduler log |
+| `/` | filter on id, description or command; `Esc` clears |
+| `s` | sort by id, next run, or state |
+| `?` | all keys |
+| `q` | close what is open, or quit |
+
+Inside a log or history view: `j`/`k` scroll, `Ctrl-D`/`Ctrl-U` page, `g`/`G` jump, `f` toggles live follow.
+
+Creating and editing jobs stays in the CLI — the dashboard only operates on jobs that already exist. Everything it can do to a job, the CLI can too (`run`, `stop`, `enable`/`disable`, `delete`, `logs`, `history`).
 
 ## Scheduler
 

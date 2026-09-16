@@ -4,7 +4,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -18,24 +20,42 @@ def local(*args):
 class CronTests(unittest.TestCase):
     def test_basic(self):
         c = k.Cron("30 9 * * *")
-        self.assertEqual(c.next_after(local(2026, 9, 13, 9, 29)), local(2026, 9, 13, 9, 30))
-        self.assertEqual(c.next_after(local(2026, 9, 13, 9, 30)), local(2026, 9, 14, 9, 30))
+        self.assertEqual(
+            c.next_after(local(2026, 9, 13, 9, 29)), local(2026, 9, 13, 9, 30)
+        )
+        self.assertEqual(
+            c.next_after(local(2026, 9, 13, 9, 30)), local(2026, 9, 14, 9, 30)
+        )
 
     def test_steps_ranges_names(self):
         c = k.Cron("*/15 9-17 * * mon-fri")
         # 2026-09-13 is a Sunday
-        self.assertEqual(c.next_after(local(2026, 9, 13, 12, 0)), local(2026, 9, 14, 9, 0))
-        self.assertEqual(c.next_after(local(2026, 9, 14, 9, 7)), local(2026, 9, 14, 9, 15))
-        self.assertEqual(c.next_after(local(2026, 9, 14, 17, 45)), local(2026, 9, 15, 9, 0))
+        self.assertEqual(
+            c.next_after(local(2026, 9, 13, 12, 0)), local(2026, 9, 14, 9, 0)
+        )
+        self.assertEqual(
+            c.next_after(local(2026, 9, 14, 9, 7)), local(2026, 9, 14, 9, 15)
+        )
+        self.assertEqual(
+            c.next_after(local(2026, 9, 14, 17, 45)), local(2026, 9, 15, 9, 0)
+        )
 
     def test_dom_dow_or(self):
         c = k.Cron("0 0 1 * sun")  # 1st of month OR Sunday
-        self.assertEqual(c.next_after(local(2026, 9, 13, 1, 0)), local(2026, 9, 20, 0, 0))
-        self.assertEqual(c.next_after(local(2026, 9, 27, 1, 0)), local(2026, 10, 1, 0, 0))
+        self.assertEqual(
+            c.next_after(local(2026, 9, 13, 1, 0)), local(2026, 9, 20, 0, 0)
+        )
+        self.assertEqual(
+            c.next_after(local(2026, 9, 27, 1, 0)), local(2026, 10, 1, 0, 0)
+        )
 
     def test_aliases_and_errors(self):
-        self.assertEqual(k.Cron("@daily").next_after(local(2026, 1, 1, 5)), local(2026, 1, 2))
-        self.assertEqual(k.Cron("0 0 29 2 *").next_after(local(2026, 3, 1)), local(2028, 2, 29))
+        self.assertEqual(
+            k.Cron("@daily").next_after(local(2026, 1, 1, 5)), local(2026, 1, 2)
+        )
+        self.assertEqual(
+            k.Cron("0 0 29 2 *").next_after(local(2026, 3, 1)), local(2028, 2, 29)
+        )
         for bad in ("* * *", "60 * * * *", "* * * * 8", "a b c d e"):
             with self.assertRaises(k.KoyomiError):
                 k.Cron(bad)
@@ -86,7 +106,10 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(len(self.tick(cur)), 1)
         self.assertEqual(self.out.read_text(), "ran\n")
         job = k.load_job("j")
-        self.assertGreater(k.parse_iso(job["next_run"]), cur)
+        next_run = k.parse_iso(job["next_run"])
+        self.assertIsNotNone(next_run)
+        assert next_run is not None
+        self.assertGreater(next_run, cur)
         self.assertEqual(job["last_run"]["status"], "success")
         self.assertIsNone(job["running"])
         # a second tick at the same moment must not run again
@@ -94,7 +117,15 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(self.out.read_text(), "ran\n")
 
     def test_catchup_skip(self):
-        self.add("j", "--every", "1h", "--catchup", "skip", "--cmd", f"echo ran >> {self.out}")
+        self.add(
+            "j",
+            "--every",
+            "1h",
+            "--catchup",
+            "skip",
+            "--cmd",
+            f"echo ran >> {self.out}",
+        )
         cur = k.now()
         self.set_next_run("j", cur - dt.timedelta(hours=3))
         self.assertEqual(len(self.tick(cur)), 0)
@@ -149,20 +180,83 @@ class SchedulerTests(unittest.TestCase):
         k.tick(k.now())
         job = k.load_job("j")
         self.assertIsNone(job["running"])
-        self.assertEqual(k.read_json(k.run_json_path("j", rec["run_id"]))["status"], "interrupted")
+        self.assertEqual(
+            k.read_json(k.run_json_path("j", rec["run_id"]))["status"], "interrupted"
+        )
 
     def test_disabled_and_reenable_do_not_backfill(self):
         self.add("j", "--every", "1h", "--cmd", f"echo ran >> {self.out}")
         k.main(["disable", "j"])
         self.assertEqual(len(self.tick(k.now() + dt.timedelta(hours=5))), 0)
         k.main(["enable", "j"])
-        self.assertGreater(k.parse_iso(k.load_job("j")["next_run"]), k.now())
+        next_run = k.parse_iso(k.load_job("j")["next_run"])
+        self.assertIsNotNone(next_run)
+        assert next_run is not None
+        self.assertGreater(next_run, k.now())
 
     def test_json_is_plain(self):
         self.add("j", "--cron", "@daily", "--", "echo", "hello world")
         data = json.loads(k.job_path("j").read_text())
         self.assertEqual(data["command"], "echo 'hello world'")
         self.assertEqual(data["schedule"], {"cron": "@daily"})
+
+    def test_dashboard_snapshot_and_controls(self):
+        self.add("j", "--every", "1h", "--cmd", "true")
+        alive, daemon, jobs = k.dashboard_snapshot()
+        self.assertFalse(alive)
+        self.assertIsNone(daemon)
+        self.assertEqual(k.dashboard_status(jobs[0]), "enabled")
+        changed = k.set_job_enabled("j", False)
+        self.assertFalse(changed["enabled"])
+        self.assertIsNone(changed["next_run"])
+        self.assertEqual(k.dashboard_status(changed), "disabled")
+
+    def test_tui_view_filter_and_sort(self):
+        self.add("beta", "--every", "1h", "--cmd", "true", "--description", "nightly")
+        self.add("alpha", "--cron", "@daily", "--cmd", "echo hello")
+        k.main(["disable", "alpha"])
+        app = k.TuiApp(None, 1.0)
+        app.all_jobs = k.load_jobs()
+        app.apply_view()
+        self.assertEqual([j["id"] for j in app.jobs], ["alpha", "beta"])
+        app.sort = "next"  # a disabled job has no next run and sorts last
+        app.apply_view()
+        self.assertEqual([j["id"] for j in app.jobs], ["beta", "alpha"])
+        app.filter = "nightly"  # matches the description, not the id
+        app.apply_view()
+        self.assertEqual([j["id"] for j in app.jobs], ["beta"])
+        self.assertEqual(app.selected_id, "beta")
+        app.filter = "nothing here"
+        app.apply_view()
+        self.assertEqual(app.jobs, [])
+        self.assertIsNone(app.selected_id)
+
+    def test_stop_run_and_delete_job(self):
+        self.add("j", "--every", "1h", "--cmd", "sleep 30")
+        with self.assertRaises(k.KoyomiError):
+            k.stop_run("j")  # nothing is running
+        rec = k.start_detached_run("j")
+        for _ in range(50):
+            if (k.load_job("j").get("running") or {}).get("pid"):
+                break
+            time.sleep(0.1)
+        time.sleep(0.5)  # let the runner reach the command before interrupting it
+        self.assertEqual(k.main(["stop", "j"]), 0)  # waits for the runner to finish
+        job = k.load_job("j")
+        self.assertIsNone(job["running"])
+        self.assertEqual(job["last_run"]["status"], "interrupted")
+        self.assertEqual(job["last_run"]["run_id"], rec["run_id"])
+        k.delete_job("j")
+        self.assertFalse(k.job_path("j").exists())
+        self.assertFalse(k.runs_dir("j").exists())
+
+    def test_tui_parser_and_noninteractive_rejection(self):
+        args = k.build_parser().parse_args(["ui", "--refresh", "0.5"])
+        self.assertEqual(args.command, "ui")
+        self.assertEqual(args.refresh, 0.5)
+        with mock.patch("sys.stdin.isatty", return_value=False):
+            with self.assertRaises(k.KoyomiError):
+                k.cmd_tui(args)
 
 
 if __name__ == "__main__":

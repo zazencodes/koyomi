@@ -52,6 +52,7 @@ koyomi disable <id> / koyomi enable <id>   # re-enabling does not back-fill miss
 koyomi delete <id>              # also deletes run history unless --keep-logs
 koyomi run <id>                 # run now in foreground; exit code = job's exit code
 koyomi run <id> --detach        # run now in background
+koyomi stop <id>                # interrupt the active run (records it as "interrupted")
 ```
 
 ## Debugging
@@ -61,6 +62,7 @@ koyomi status                   # scheduler health + jobs whose last run failed
 koyomi history [<id>] [--failed] [-n 50] [--json]
 koyomi logs <id>                # output of latest run (--run RUN_ID for a specific one, -n 0 = all)
 koyomi logs --daemon            # scheduler events: starts, skips, catch-ups, interruptions
+koyomi tui                      # interactive dashboard (for the user, not for agents)
 ```
 
 Run statuses: `running`, `success`, `failed` (non-zero exit), `timeout`, `interrupted`
