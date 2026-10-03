@@ -16,16 +16,16 @@ koyomi init HOST ...                  # once: name this host, point it at the hu
 ./install.sh                          # CLI + scheduler service + agent skill; re-run after editing the code
 ```
 
-`koyomi init` stores `~/.koyomi/config.json` (mode 600): the host name, how to reach the hub, and the SMTP settings for alert email (read from a dotenv file with `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`).
+`koyomi init` stores `~/.koyomi/config.json` (mode 600): the host name, how to reach the hub, and the SMTP settings for alert email (read from a dotenv file with `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`). Alerts go out through Amazon SES from `noreply@alerts.galea.dev`; the credentials file and its setup are in `~/pro/galea.dev-aws-ses-email` (`koyomi-smtp.env`, README section *alerts.galea.dev*).
 
 ```bash
 # the hub, an always-on server
-koyomi init emanator --hub-local --always-on --smtp-env smtp.env \
-  --email-from "Koyomi <koyomi@mail.zazencodes.com>" --email-to you@example.com
+koyomi init emanator --hub-local --always-on --smtp-env koyomi-smtp.env \
+  --email-from "Koyomi <noreply@alerts.galea.dev>" --email-to alex@galea.dev
 
 # a laptop that reaches the hub over ssh (key-based login, no passphrase prompt)
-koyomi init mac --hub-ssh emanator --hub-koyomi /root/.local/bin/koyomi --smtp-env smtp.env \
-  --email-from "Koyomi <koyomi@mail.zazencodes.com>" --email-to you@example.com
+koyomi init mac --hub-ssh emanator --hub-koyomi /root/.local/bin/koyomi --smtp-env koyomi-smtp.env \
+  --email-from "Koyomi <noreply@alerts.galea.dev>" --email-to alex@galea.dev
 ```
 
 `./install.sh` installs the service (launchd agent on macOS; systemd unit on Linux, as root), which bakes in the current shell's `PATH` for scheduled jobs. Hub and hosts must run the same Koyomi version: a mismatch fails every call until both are reinstalled.
