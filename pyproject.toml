@@ -1,7 +1,7 @@
 [project]
 name = "koyomi"
-version = "0.1.0"
-description = "Tiny local job scheduler with plain-JSON state in ~/.koyomi"
+version = "0.2.0"
+description = "Small job scheduler for a few machines, with plain-JSON state on a hub"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
