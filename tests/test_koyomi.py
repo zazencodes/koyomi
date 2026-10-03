@@ -1,5 +1,6 @@
 import base64
 import datetime as dt
+import io
 import json
 import os
 import subprocess
@@ -28,6 +29,14 @@ EMAIL = {
 
 def toronto(*args):
     return dt.datetime(*args, tzinfo=TORONTO)
+
+
+def unstamp(log: str) -> str:
+    """The log without its line stamps; fails if a line is unstamped."""
+    lines = log.split("\n")
+    for line in lines[:-1] if log.endswith("\n") else lines:
+        assert k.LOG_STAMP.match(line), line
+    return "\n".join(k.LOG_STAMP.sub("", line, count=1) for line in lines)
 
 
 class CronTests(unittest.TestCase):
@@ -360,7 +369,7 @@ class ControlTests(HubCase):
         run = k.load_run("j", rec["run_id"])
         self.assertEqual((run["status"], run["trigger"]), ("success", "manual"))
         out = k.op_log("j", None, lines=0)
-        self.assertEqual(base64.b64decode(out["data"]), b"hello\nbye")
+        self.assertEqual(unstamp(base64.b64decode(out["data"]).decode()), "hello\nbye")
         self.assertFalse(k.spool_path(rec["run_id"]).exists())
 
     def test_manual_run_needs_a_live_host(self):
@@ -472,7 +481,7 @@ class RemoteHostTests(HubCase):
         self.assertEqual(run["status"], "success")
         self.assertEqual(run["host"], "mac")
         log = k.run_log_path("m", run["run_id"]).read_text()
-        self.assertEqual(log, f"{work.resolve()}\nmac\n")
+        self.assertEqual(unstamp(log), f"{work.resolve()}\nmac\n")
         self.assertEqual(self.alerts(), [])  # a laptop catching up is not an alert
 
     def test_errors_and_version_cross_the_wire(self):
@@ -546,25 +555,88 @@ class ServiceAndUiTests(HubCase):
         self.assertIn('Environment="HOME=', unit)
         self.assertIn(" daemon\n", unit)
 
-    def test_tui_view_filter_and_sort(self):
+    def test_tui_sort_and_search(self):
         self.add("beta", "--every", "1h", "--cmd", "true", "--description", "nightly")
         self.add("alpha", "--cron", "@daily", "--cmd", "echo hello")
+        self.add("gamma", "--every", "2h", "--cmd", "true", "--description", "Nightly")
         self.cli("disable", "alpha")
         app = k.TuiApp(None, 1.0)
         app.all_jobs = k.op_jobs()
         app.apply_view()
-        self.assertEqual([j["id"] for j in app.jobs], ["alpha", "beta"])
+        self.assertEqual([j["id"] for j in app.jobs], ["alpha", "beta", "gamma"])
         app.sort = "next"  # a disabled job has no next run and sorts last
         app.apply_view()
-        self.assertEqual([j["id"] for j in app.jobs], ["beta", "alpha"])
-        app.filter = "nightly"  # matches the description, not the id
-        app.apply_view()
-        self.assertEqual([j["id"] for j in app.jobs], ["beta"])
+        self.assertEqual([j["id"] for j in app.jobs], ["beta", "gamma", "alpha"])
+        app.selected_id = "alpha"
+        for key in map(ord, "/night"):  # smartcase: matches both descriptions
+            app.handle_key(key)
+        self.assertEqual(app.selected_id, "beta")  # the first match, wrapping
+        app.handle_key(10)
+        self.assertEqual(app.query, "night")
+        app.handle_key(ord("n"))
+        self.assertEqual(app.selected_id, "gamma")
+        app.handle_key(ord("n"))
         self.assertEqual(app.selected_id, "beta")
-        app.filter = "nothing here"
+        app.handle_key(ord("N"))
+        self.assertEqual(app.selected_id, "gamma")
+        for key in map(ord, "/Night"):  # an uppercase letter: case-sensitive
+            app.handle_key(key)
+        app.handle_key(10)
+        self.assertEqual(app.job_matches(), [1])
+        app.handle_key(27)  # Esc clears the search
+        self.assertEqual(app.query, "")
+        app.handle_key(ord("/"))
+        app.handle_key(ord("x"))
+        app.handle_key(27)  # Esc while typing goes back where it started
+        self.assertEqual((app.mode, app.selected_id), (None, "gamma"))
+
+    def test_tui_log_search(self):
+        app = k.TuiApp(None, 1.0)
+        app.screen = mock.Mock(**{"getmaxyx.return_value": (14, 80)})  # 10 rows
+        lines = [
+            f"line {i}" + (" error" if i in (3, 30, 60) else "") for i in range(80)
+        ]
+        app.open_pager("log", "static", [k.log_segments(line) for line in lines])
+        for key in map(ord, "/error"):
+            app.handle_key(key)
+        app.handle_key(10)
+        self.assertEqual(app.current_match(), (3, 7, 12))
+        app.handle_key(ord("n"))
+        self.assertEqual(app.current_match()[0], 30)
+        self.assertTrue(app.pager["scroll"] <= 30 < app.pager["scroll"] + 10)
+        app.handle_key(ord("n"))
+        app.handle_key(ord("n"))  # wraps to the first
+        self.assertEqual(app.current_match()[0], 3)
+        app.handle_key(ord("N"))  # and back to the last
+        self.assertEqual(app.current_match()[0], 60)
+        self.assertEqual(
+            k.mark([("ab", "faint"), ("cdef", "text")], [(1, 3, True)]),
+            [("a", "faint"), ("b", "match_now"), ("c", "match_now"), ("def", "text")],
+        )
+
+    def test_log_lines_are_stamped_as_they_begin(self):
+        out = io.BytesIO()
+        log = k.StampedLog(out)
+        for chunk in (b"one\ntw", b"o\n", b"", b"thr", b"ee"):
+            log.write(chunk)
+        lines = out.getvalue().decode().split("\n")
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(unstamp(out.getvalue().decode()), "one\ntwo\nthree")
+        stamp, text = k.split_log_line(lines[0])
+        self.assertRegex(stamp, r"^\d\d:\d\d:\d\d$")
+        self.assertEqual(text, "one")
+        self.assertEqual(k.split_log_line("plain"), ("", "plain"))
+
+    def test_tui_run_asks_first(self):
+        self.add("beta", "--every", "1h", "--cmd", "true")
+        app = k.TuiApp(None, 1.0)
+        app.all_jobs = k.op_jobs()
         app.apply_view()
-        self.assertEqual(app.jobs, [])
-        self.assertIsNone(app.selected_id)
+        app.handle_key(ord("r"))
+        self.assertEqual(app.mode, "confirm")
+        app.handle_key(ord("n"))  # anything but y cancels
+        self.assertIsNone(app.mode)
+        self.assertEqual(k.op_runs("beta", False, 0), [])
 
     def test_tui_parser_and_noninteractive_rejection(self):
         args = k.build_parser().parse_args(["ui", "--refresh", "0.5"])

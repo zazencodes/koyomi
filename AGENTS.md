@@ -20,6 +20,7 @@
 ## Workflow
 
 - The installed CLI/daemon is a **copy** in the uv tool venv, not this checkout. After changing `koyomi.py`, run `./install.sh` on every machine (on the hub first): `rsync`/`git pull` the checkout to `emanator:/root/koyomi`, then `ssh emanator 'cd /root/koyomi && ./install.sh'`, then `./install.sh` here.
+- After every change to `koyomi.py`, run `./install.sh` on this Mac without being asked, so `koyomi` (including `koyomi tui`) runs the new code. A change that touches the hub (ops, `VERSION`, daemon) still goes to the hub first, as above.
 - Set `KOYOMI_HOME=/some/tmp/dir` with a `config.json` whose `hub` is `"local"` to experiment without touching real state.
 - `service install` bakes the current shell's `PATH` (and `HOME`) into the plist/unit; scheduled jobs use that PATH.
 
@@ -29,6 +30,7 @@
 - The daemon reaps runners by polling them; don't set `SIGCHLD` to `SIG_IGN` (it would make every `subprocess.run`, including ssh to the hub, report exit 0).
 - Dead runners are found by their host (pid liveness + boot time, `runner_gone`) and reported with `mark_interrupted`.
 - `run_progress` appends at a byte offset and is idempotent, so runners can retry through hub outages.
+- The runner pipes command output through `StampedLog`, which starts every line with its UTC time (`LOG_STAMP`); `split_log_line` renders it. The TUI makes every hub call on its `HubWorker` thread, never on the UI thread.
 - The systemd unit uses `KillMode=process` so restarting Koyomi doesn't kill runs in flight. launchd `bootout` is async; `service install` waits before `bootstrap`.
 
 ## Validation

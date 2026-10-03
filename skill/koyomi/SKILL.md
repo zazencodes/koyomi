@@ -96,7 +96,7 @@ koyomi stop <id>                # stop the active run (recorded as "stopped", no
 ```bash
 koyomi status                   # hosts, scheduler health, failing jobs, unsent alerts
 koyomi history [<id>] [--failed] [-n 50] [--json]
-koyomi logs <id>                # output of latest run (--run RUN_ID for a specific one, -n 0 = all)
+koyomi logs <id>                # output of latest run, lines prefixed with local HH:MM:SS (--run RUN_ID, -n 0 = all)
 koyomi logs --daemon            # scheduling events from every host: starts, skips, catch-ups, alerts
 koyomi tui                      # interactive dashboard (for the user, not for agents)
 ```

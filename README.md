@@ -42,7 +42,7 @@ koyomi list                # jobs, host, next run, last result
 koyomi show report         # details and upcoming run times
 koyomi run report          # run now on its host, stream the output (Ctrl-C stops the run)
 koyomi stop report         # stop the active run
-koyomi logs report         # output of the latest run
+koyomi logs report         # output of the latest run, each line with its time
 koyomi history --failed    # past runs
 koyomi status              # hosts, scheduler health, failing jobs, unsent alerts
 koyomi tui                 # live terminal dashboard
@@ -74,19 +74,22 @@ A job alerts once per failure streak: after a failed, timed-out, interrupted or 
 | key | action |
 | --- | --- |
 | `j`/`k`, `↑`/`↓`, `g`/`G`, PgUp/PgDn | move the selection |
-| `Enter` | toggle the detail pane (command, host, cwd, options, last run) |
+| `Enter` | open the job page |
 | `e` | enable / disable (an active run keeps going) |
-| `r` | run now on the job's host |
+| `r` | run now on the job's host (asks first) |
 | `x` | stop the active run (asks first) |
 | `d` | delete the job and its history (asks first) |
-| `l` / `h` | log of the latest run (live-follows) / run history |
 | `D` | scheduler log of every host |
-| `/` | filter on id, host, description or command; `Esc` clears |
+| `/` | search id, host, description and command; `n`/`N` next/previous match; `Esc` clears |
 | `s` | sort by id, host, next run, or state |
 | `?` | all keys |
 | `q` | close what is open, or quit |
 
-Inside a log or history view: `j`/`k` scroll, `Ctrl-D`/`Ctrl-U` page, `g`/`G` jump, `f` toggles live follow.
+The job page shows the job's command, schedule and options, its runs (newest first) and the tail of the picked run's log, live while it runs. `j`/`k` pick a run, `Enter` downloads its whole log and opens it, `e`/`r`/`x` work as on the list, and `Esc` goes back.
+
+Inside a log: `j`/`k` scroll, `Ctrl-D`/`Ctrl-U` page, `g`/`G` jump, `f` toggles live follow, `/` searches (`n`/`N` step through the matches, as in vim; an uppercase letter makes it case-sensitive).
+
+Every output line is stamped with the time it was written; the dashboard and `koyomi logs` show it in local time. Logs from before stamping show without times.
 
 Creating and editing jobs stays in the CLI.
 

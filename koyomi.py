@@ -37,6 +37,7 @@ import fcntl
 import json
 import os
 import plistlib
+import queue
 import re
 import shlex
 import signal
@@ -44,6 +45,7 @@ import smtplib
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from email.message import EmailMessage
@@ -1186,6 +1188,52 @@ def kill_group(proc: subprocess.Popen) -> None:
             continue
 
 
+# Each output line starts with the UTC time its first byte arrived and a space.
+LOG_STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z) ")
+
+
+class StampedLog:
+    """Writes command output to the spool, stamping each line as it begins."""
+
+    def __init__(self, f):
+        self.f, self.line_start = f, True
+
+    def write(self, data: bytes) -> None:
+        out, start = bytearray(), 0
+        while start < len(data):
+            end = data.find(b"\n", start)
+            end = len(data) if end < 0 else end + 1
+            if self.line_start:
+                stamp = dt.datetime.now(dt.timezone.utc).isoformat(
+                    timespec="milliseconds"
+                )
+                out += stamp.replace("+00:00", "Z ").encode()
+            out += data[start:end]
+            self.line_start = data[end - 1 : end] == b"\n"
+            start = end
+        self.f.write(out)
+
+    def pump(self, fd: int) -> None:
+        """Copy a pipe into the log until every writer has closed it."""
+        with contextlib.suppress(ValueError, OSError):  # ValueError: log closed
+            while chunk := os.read(fd, 65536):
+                self.write(chunk)
+
+
+def split_log_line(line: str) -> tuple[str, str]:
+    """A log line as (local HH:MM:SS, text); the time is "" for unstamped lines."""
+    m = LOG_STAMP.match(line)
+    if not m:
+        return "", line
+    t = dt.datetime.fromisoformat(m.group(1).replace("Z", "+00:00"))
+    return t.astimezone().strftime("%H:%M:%S"), line[m.end() :]
+
+
+def render_log_line(line: str) -> str:
+    stamp, text = split_log_line(line)
+    return f"{stamp}  {text}" if stamp else text
+
+
 def upload_output(job_id: str, run_id: str, offset: int) -> tuple[int, bool]:
     """Send spooled output from offset; returns (hub's log size, stop requested)."""
     with open(spool_path(run_id), "rb") as f:
@@ -1223,14 +1271,15 @@ def execute(job_id: str, run_id: str) -> int:
     timeout = parse_duration(rec["timeout"]) if rec["timeout"] else None
     status, exit_code, error = "failed", None, None
     started, offset, hub_error = time.time(), 0, None
-    with open(spool, "ab") as log:
+    with open(spool, "ab") as spool_file:
+        log = StampedLog(spool_file)
         try:
             proc = subprocess.Popen(
                 ["/bin/sh", "-c", rec["command"]],
                 cwd=rec["cwd"],
                 env=env,
                 stdin=subprocess.DEVNULL,
-                stdout=log,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
@@ -1238,6 +1287,11 @@ def execute(job_id: str, run_id: str) -> int:
             error = f"could not start command: {e}"
             log.write(f"koyomi: {error}\n".encode())
         else:
+            assert proc.stdout is not None
+            pump = threading.Thread(
+                target=log.pump, args=(proc.stdout.fileno(),), daemon=True
+            )
+            pump.start()
             next_sync = time.time() + SYNC_SECONDS
             try:
                 while True:
@@ -1261,7 +1315,7 @@ def execute(job_id: str, run_id: str) -> int:
                     if time.time() < next_sync:
                         continue
                     next_sync = time.time() + SYNC_SECONDS
-                    log.flush()
+                    spool_file.flush()
                     try:
                         offset, stop = upload_output(job_id, run_id, offset)
                     except HubUnreachable as e:
@@ -1280,6 +1334,9 @@ def execute(job_id: str, run_id: str) -> int:
             except BaseException:
                 kill_group(proc)
                 raise
+            # Output a background child still writes after the command exits is
+            # not waited for.
+            pump.join(timeout=2)
     result = {
         "status": status,
         "exit_code": exit_code,
@@ -1865,13 +1922,16 @@ def run_exit_code(rec: dict) -> int:
 
 def follow_run(job_id: str, run_id: str) -> int:
     """Stream a run's output until it ends. Ctrl-C asks the run to stop."""
-    offset, stopping = 0, False
+    offset, stopping, partial = 0, False, ""
     decode = codecs.getincrementaldecoder("utf-8")(errors="replace").decode
     while True:
         try:
             out = hub("log", job_id=job_id, run_id=run_id, offset=offset)
-            sys.stdout.write(decode(base64.b64decode(out["data"])))
-            sys.stdout.flush()
+            *lines, partial = (partial + decode(base64.b64decode(out["data"]))).split(
+                "\n"
+            )
+            for line in lines:
+                print(render_log_line(line), flush=True)
             offset = out["size"]
             rec = out["run"]
             if rec["status"] not in ACTIVE_STATES:
@@ -1886,6 +1946,8 @@ def follow_run(job_id: str, run_id: str) -> int:
                 file=sys.stderr,
             )
             hub("request_stop", job_id=job_id)
+    if partial:
+        print(render_log_line(partial))
     print(
         f"--- koyomi: {job_id} {rec['status']} on {rec['host']} "
         f"(exit {rec['exit_code']}, {fmt_dur(rec['duration_seconds'])}) run {run_id}",
@@ -2059,7 +2121,8 @@ def cmd_logs(args) -> int:
         f"started {fmt_time(rec['started_at'])}",
         file=sys.stderr,
     )
-    print(base64.b64decode(out["data"]).decode(errors="replace"))
+    for line in base64.b64decode(out["data"]).decode(errors="replace").splitlines():
+        print(render_log_line(line))
     return 0
 
 
@@ -2115,22 +2178,40 @@ def cmd_status(args) -> int:
 # ---------------------------------------------------------------- terminal UI
 
 FAILURE_STATES = ALERT_STATES
-STATE_COLORS = {
-    "running": "cyan",
-    "queued": "cyan",
-    "disabled": "dim",
-    "done": "dim",
-    "enabled": "green",
+# 256-color palette; -1 is the terminal's own foreground. A style name ending
+# in "*" is drawn bold. Terminals without 256 colors get plain attributes.
+PALETTE = {
+    "text": -1,
+    "muted": 245,
+    "faint": 240,
+    "rule": 237,
+    "accent": 179,
+    "green": 114,
+    "red": 203,
+    "yellow": 221,
+    "cyan": 80,
+    "match": (16, 137),  # search hits: (foreground, background)
+    "match_now": (16, 221),  # the hit n / N landed on
 }
-RUN_COLORS = {
-    "success": "green",
-    "failed": "red",
-    "timeout": "red",
-    "interrupted": "red",
-    "stopped": "yellow",
-    "skipped": "yellow",
-    "queued": "cyan",
-    "running": "cyan",
+SELECTED_BG = 236
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# job state -> (style, glyph); the order is also the "state" sort order
+STATE_STYLES = {
+    "running": ("cyan", None),  # spinner
+    "queued": ("cyan", "◌"),
+    "disabled": ("faint", "○"),
+    "done": ("faint", "✓"),
+    "enabled": ("green", "●"),
+}
+RUN_STYLES = {
+    "success": ("green", "✓"),
+    "failed": ("red", "✗"),
+    "timeout": ("red", "✗"),
+    "interrupted": ("red", "✗"),
+    "stopped": ("yellow", "■"),
+    "skipped": ("yellow", "↷"),
+    "queued": ("cyan", "◌"),
+    "running": ("cyan", "●"),
 }
 
 
@@ -2155,30 +2236,180 @@ def cmd_tui(args) -> int:
 TUI_COLUMNS = [
     ("JOB", "id", 0),
     ("HOST", "host", 9),
-    ("STATE", "state", 8),
+    ("STATE", "state", 10),
     ("SCHEDULE", "schedule", -1),
-    ("NEXT", "next", 13),
-    ("LAST", "last", 11),
-    ("WHEN", "when", 12),
+    ("NEXT", "next", 11),
+    ("LAST", "last", 13),
+    ("WHEN", "when", 11),
 ]
+TUI_GAP = 2
+TUI_BODY_TOP = 6
 TUI_KEYS = [
-    ("j / k, ↑ ↓", "move selection"),
-    ("g / G", "first / last job"),
-    ("PgUp / PgDn", "page up / down"),
-    ("Enter", "toggle the detail pane"),
-    ("e", "enable / disable (an active run keeps going)"),
-    ("r", "run now, on the job's host"),
-    ("x", "stop the active run"),
-    ("d", "delete the job and its history (asks first)"),
-    ("l", "log of the latest run (live)"),
-    ("h", "run history"),
-    ("D", "scheduler log of every host (live)"),
-    ("/", "filter jobs; Esc clears the filter"),
-    ("s", "sort by id / host / next run / state"),
-    ("Ctrl-L", "redraw"),
-    ("q", "quit, or close what is open"),
+    (
+        "jobs",
+        [
+            ("j / k, ↑ ↓", "move selection"),
+            ("g / G", "first / last job"),
+            ("PgUp / PgDn", "page up / down"),
+            ("Enter", "open the job: its runs and their logs"),
+            ("e", "enable / disable (an active run keeps going)"),
+            ("r", "run now, on the job's host (asks first)"),
+            ("x", "stop the active run (asks first)"),
+            ("d", "delete the job and its history (asks first)"),
+            ("/", "search jobs; n / N next / previous match; Esc clears"),
+            ("s", "sort by id / host / next run / state"),
+            ("D", "scheduler log of every host (live)"),
+            ("q", "quit"),
+        ],
+    ),
+    (
+        "job",
+        [
+            ("j / k, ↑ ↓", "pick a run; its log shows on the right"),
+            ("g / G", "newest / oldest run"),
+            ("Enter", "read the whole log of the run (live while running)"),
+            ("e, r, x", "enable / disable, run now, stop, as on the job list"),
+            ("q, Esc", "back to the job list"),
+        ],
+    ),
+    (
+        "log",
+        [
+            ("j / k", "scroll"),
+            ("Ctrl-D / U", "page down / up"),
+            ("g / G", "top / end"),
+            ("f", "follow new output"),
+            ("/", "search; n / N next / previous match"),
+            ("q, Esc", "close (Esc clears a search first)"),
+        ],
+    ),
 ]
+DASHBOARD_HINTS = [
+    ("j/k", "move"),
+    ("⏎", "open"),
+    ("e", "toggle"),
+    ("r", "run"),
+    ("x", "stop"),
+    ("/", "search"),
+    ("s", "sort"),
+    ("?", "help"),
+    ("q", "quit"),
+]
+JOB_HINTS = [
+    ("j/k", "runs"),
+    ("⏎", "full log"),
+    ("r", "run"),
+    ("x", "stop"),
+    ("e", "toggle"),
+    ("esc", "back"),
+    ("?", "help"),
+]
+PAGER_HINTS = [
+    ("j/k", "scroll"),
+    ("^D/^U", "page"),
+    ("g/G", "top/end"),
+    ("f", "follow"),
+    ("/", "search"),
+    ("q", "close"),
+]
+RUNS_WIDTH = 38  # the run list beside the log on the job page
+PREVIEW_LINES = 200  # log tail fetched for the job page; Enter downloads it all
+QUIET_KEYS = 0.15  # seconds without a key before the job page fetches a preview
 SORTS = ("id", "host", "next", "state")
+
+
+DAEMON_LOG_LINES = 500
+
+
+def log_segments(line: str) -> list[tuple[str, str]]:
+    """A run log line for the UI: its stamp as a faint local-time gutter."""
+    stamp, text = split_log_line(line.replace("\t", "    "))
+    if stamp:
+        return [(stamp + "  ", "faint"), (text, "text")]
+    return [(text, "text")]
+
+
+def line_text(segments) -> str:
+    return "".join(text for text, _ in segments)
+
+
+def search_ranges(text: str, query: str) -> list[tuple[int, int]]:
+    """Where query occurs in text; smartcase, as in vim: an uppercase letter in
+    the query makes it case-sensitive."""
+    if not query:
+        return []
+    if query == query.lower():
+        text = text.lower()
+    ranges, start = [], text.find(query)
+    while start >= 0:
+        ranges.append((start, start + len(query)))
+        start = text.find(query, start + len(query))
+    return ranges
+
+
+def mark(segments, hits) -> list[tuple[str, str]]:
+    """Restyle the (start, end, current) hits of segments as search matches."""
+    if not hits:
+        return segments
+    out, pos = [], 0
+    for text, style in segments:
+        cut = 0
+        for start, end, current in hits:
+            a, b = max(start - pos, cut), min(end - pos, len(text))
+            if a < b:
+                out += [
+                    (text[cut:a], style),
+                    (text[a:b], "match_now" if current else "match"),
+                ]
+                cut = b
+        out.append((text[cut:], style))
+        pos += len(text)
+    return [(text, style) for text, style in out if text]
+
+
+def step_to(items, origin, forward: bool, key) -> int:
+    """Index of the first item after origin (before it, backwards), wrapping."""
+    order = range(len(items)) if forward else range(len(items) - 1, -1, -1)
+    for i in order:
+        if (key(items[i]) > origin) if forward else (key(items[i]) < origin):
+            return i
+    return order[0]
+
+
+class HubWorker:
+    """Runs hub calls on a background thread, one at a time, so the UI never
+    waits on ssh. A task already queued under the same key is not queued again."""
+
+    def __init__(self):
+        self.tasks: queue.Queue = queue.Queue()
+        self.results: queue.Queue = queue.Queue()
+        self.pending: set = set()
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def submit(self, key, fn) -> None:
+        if key not in self.pending:
+            self.pending.add(key)
+            self.tasks.put((key, fn))
+
+    def serve(self) -> None:
+        while True:
+            key, fn = self.tasks.get()
+            try:
+                self.results.put((key, fn(), None))
+            except Exception as e:  # handed to the UI thread, which re-raises bugs
+                self.results.put((key, None, e))
+
+    def finished(self):
+        """(key, result, error) of every task done since the last call."""
+        while True:
+            try:
+                key, result, error = self.results.get_nowait()
+            except queue.Empty:
+                return
+            self.pending.discard(key)
+            if error is not None and not isinstance(error, KoyomiError):
+                raise error
+            yield key, result, error
 
 
 class TuiApp:
@@ -2192,14 +2423,21 @@ class TuiApp:
         self.jobs: list[dict] = []
         self.selected_id: str | None = None
         self.scroll = 0
-        self.expanded = False
+        self.page: dict | None = None  # the open job: id, runs, picked run
+        self.logs: dict[tuple, dict] = {}  # (job, run) -> its log tail
+        self.loads = 0  # completed reloads; an active run's log is per reload
         self.sort = "id"
-        self.filter = ""
-        self.mode: str | None = None  # None | "filter" | "confirm"
-        self.confirm: tuple[str, object] | None = None
+        self.query = ""  # the active search
+        self.typed = ""  # the search being typed after "/"
+        self.origin: object = None  # where the search started; Esc goes back
+        self.mode: str | None = None  # None | "search" | "confirm"
+        self.last_key = 0.0
+        self.worker = HubWorker()
+        self.confirm: tuple[str, object, str] | None = None
         self.message: tuple[str, str, float] | None = None
         self.pager: dict | None = None
-        self.colors: dict[str, int] = {}
+        self.palette = False
+        self.pairs: dict[tuple[str, bool], int] = {}
 
     # -------------------------------------------------------------- plumbing
 
@@ -2215,20 +2453,27 @@ class TuiApp:
         self.init_colors()
         self.reload()
         next_load = time.monotonic() + self.refresh
-        dirty = True
+        dirty, frame = True, ""
         while True:
+            for key, result, error in self.worker.finished():
+                self.apply(key, result, error)
+                dirty = True
+            if self.animating() and self.spinner() != frame:
+                frame, dirty = self.spinner(), True
             if dirty:
                 self.draw()
                 dirty = False
             key = self.screen.getch()
             if key != -1:
+                self.last_key = time.monotonic()
                 if self.handle_key(key):
                     return 0
                 dirty = True
+            elif time.monotonic() - self.last_key >= QUIET_KEYS:
+                self.fetch_preview()  # not while flicking through runs
             if time.monotonic() >= next_load:
                 self.reload()
                 next_load = time.monotonic() + self.refresh
-                dirty = True
 
     def init_colors(self) -> None:
         import curses
@@ -2236,53 +2481,126 @@ class TuiApp:
         with contextlib.suppress(curses.error):
             curses.start_color()
             curses.use_default_colors()
-            if not curses.has_colors():
-                return
-            for i, (name, fg) in enumerate(
-                (
-                    ("green", curses.COLOR_GREEN),
-                    ("red", curses.COLOR_RED),
-                    ("yellow", curses.COLOR_YELLOW),
-                    ("cyan", curses.COLOR_CYAN),
-                    ("blue", curses.COLOR_BLUE),
-                ),
-                1,
-            ):
-                curses.init_pair(i, fg, -1)
-                self.colors[name] = curses.color_pair(i)
-        self.colors["dim"] = curses.A_DIM
+            self.palette = curses.has_colors() and curses.COLORS >= 256
 
-    def color(self, name: str | None) -> int:
-        return self.colors.get(name or "", 0)
+    def style(self, name: str, selected: bool = False) -> int:
+        import curses
+
+        bold = name.endswith("*")
+        name = name.rstrip("*")
+        if selected and name == "faint":  # too close to the selection background
+            name = "muted"
+        attr = curses.A_BOLD if bold else 0
+        color = PALETTE[name]
+        if not self.palette:
+            if name in ("muted", "faint", "rule"):
+                attr |= curses.A_DIM
+            if name == "match_now":
+                attr |= curses.A_BOLD
+            return attr | (
+                curses.A_REVERSE if selected or name.startswith("match") else 0
+            )
+        if (name, selected) not in self.pairs:
+            fg, bg = color if isinstance(color, tuple) else (color, -1)
+            if selected and not isinstance(color, tuple):
+                bg = SELECTED_BG
+            n = len(self.pairs) + 1
+            curses.init_pair(n, fg, bg)
+            self.pairs[name, selected] = curses.color_pair(n)
+        return attr | self.pairs[name, selected]
+
+    @staticmethod
+    def spinner() -> str:
+        return SPINNER[int(time.monotonic() * 10) % len(SPINNER)]
+
+    def animating(self) -> bool:
+        if self.pager:
+            return self.pager["loading"]
+        return not self.loads or any(
+            (j.get("running") or {}).get("status") == "running" for j in self.jobs
+        )
 
     def reload(self) -> None:
-        try:
+        """Ask the worker for fresh state; apply() takes it when it arrives."""
+        job_id = self.page["job_id"] if self.page else None
+
+        def fetch():
             snap = hub("snapshot")
-            if self.pager:
-                self.pager["lines"] = self.pager["source"]()
-        except KoyomiError as e:  # hub unreachable: keep showing the last data
-            self.notify(f"refresh failed: {e}", "red")
-            return
-        self.hosts, self.all_jobs = snap["hosts"], snap["jobs"]
-        self.unsent = len(snap["unsent_alerts"])
-        self.apply_view()
+            runs = None
+            if job_id in {j["id"] for j in snap["jobs"]}:
+                runs = self.load_runs(job_id)
+            return snap, job_id, runs
+
+        self.worker.submit(("reload",), fetch)
+        pager = self.pager
+        if pager and pager["kind"] == "run" and pager["active"]:
+            self.fetch_run_log()
+        elif pager and pager["kind"] == "daemon":
+            self.worker.submit(
+                ("daemon_log",), lambda: hub("daemon_log", lines=DAEMON_LOG_LINES)
+            )
+
+    def apply(self, key: tuple, result, error: KoyomiError | None) -> None:
+        """Take a finished worker task into the UI state."""
+        kind = key[0]
+        if kind == "reload":
+            if error:  # hub unreachable: keep showing the last data
+                self.notify(f"refresh failed: {error}", "red")
+                return
+            snap, job_id, runs = result
+            self.loads += 1
+            self.hosts, self.all_jobs = snap["hosts"], snap["jobs"]
+            self.unsent = len(snap["unsent_alerts"])
+            if self.page and not self.page_job:
+                self.notify(f"{self.page['job_id']} no longer exists", "yellow")
+                self.page = None
+            elif self.page and runs is not None and self.page["job_id"] == job_id:
+                self.page["runs"] = runs
+            self.apply_view()
+        elif kind == "preview":
+            status, loads, out = result or (None, None, None)
+            if error:
+                lines = [[(str(error), "red")]]
+            else:
+                text = base64.b64decode(out["data"]).decode(errors="replace")
+                lines = [log_segments(line) for line in text.splitlines()]
+            self.logs[key[1:]] = {"status": status, "loads": loads, "lines": lines}
+        elif kind == "log":
+            pager = self.pager
+            if not pager or pager.get("run") != key[1:]:
+                return  # closed, or another log opened since
+            pager["loading"] = False
+            if error:
+                self.notify(f"log download failed: {error}", "red")
+                return
+            pager["size"] = result["size"]
+            pager["active"] = result["run"]["status"] in ACTIVE_STATES
+            self.append_log(pager, pager["decode"](base64.b64decode(result["data"])))
+        elif kind == "daemon_log":
+            if self.pager and self.pager["kind"] == "daemon":
+                self.pager["loading"] = False
+                if error:
+                    self.notify(str(error), "red")
+                    return
+                self.pager["lines"] = [[(line, "text")] for line in result.splitlines()]
+                self.pager["version"] += 1
+
+    @staticmethod
+    def load_runs(job_id: str) -> list[dict]:
+        return list(reversed(hub("runs", job_id=job_id, failed=False, limit=200)))
 
     def apply_view(self) -> None:
         """Re-derive the visible job list, keeping the selection where it can."""
-        jobs = self.all_jobs
-        if self.filter:
-            needle = self.filter.lower()
-            jobs = [j for j in jobs if needle in self.haystack(j)]
         keys = {
             "id": lambda j: j["id"],
             "host": lambda j: (j["host"], j["id"]),
             "next": lambda j: (j.get("next_run") is None, j.get("next_run") or ""),
             "state": lambda j: (
-                list(STATE_COLORS).index(job_status_word(j)),
+                list(STATE_STYLES).index(job_status_word(j)),
                 j["id"],
             ),
         }
-        self.jobs = sorted(jobs, key=keys[self.sort])
+        self.jobs = sorted(self.all_jobs, key=keys[self.sort])
         if not self.jobs:
             self.selected_id = None
         elif self.selected_id not in {j["id"] for j in self.jobs}:
@@ -2290,9 +2608,10 @@ class TuiApp:
 
     @staticmethod
     def haystack(job: dict) -> str:
+        """What a search of the job list looks through."""
         return " ".join(
             (job["id"], job["host"], job.get("description") or "", job["command"])
-        ).lower()
+        )
 
     @property
     def index(self) -> int:
@@ -2305,7 +2624,7 @@ class TuiApp:
     def job(self) -> dict | None:
         return self.jobs[self.index] if self.jobs else None
 
-    def notify(self, text: str, color: str = "") -> None:
+    def notify(self, text: str, color: str = "text") -> None:
         self.message = (text, color, time.monotonic())
 
     # ----------------------------------------------------------------- draw
@@ -2320,94 +2639,161 @@ class TuiApp:
         _, width = self.screen.getmaxyx()
         self.add(y, 0, " " * (width - 1), attr)
 
+    def put(
+        self, y: int, x: int, segments, limit: int | None = None, selected=False
+    ) -> int:
+        """Draw (text, style) segments from x, clipping to limit cells with an
+        ellipsis; returns the x after the last cell drawn."""
+        for text, name in segments:
+            if limit is not None:
+                if limit <= 0:
+                    break
+                if len(text) > limit:
+                    text = text[: limit - 1] + "…"
+                limit -= len(text)
+            self.add(y, x, text, self.style(name, selected))
+            x += len(text)
+        return x
+
+    @staticmethod
+    def span(segments) -> int:
+        return sum(len(text) for text, _ in segments)
+
+    def put_right(self, y: int, right: int, segments) -> None:
+        self.put(y, right - self.span(segments), segments)
+
+    def rule(self, y: int, title: str = "") -> None:
+        _, width = self.screen.getmaxyx()
+        if title:
+            end = self.put(y, 1, [("── ", "rule"), (title, "text*"), (" ", "rule")])
+            self.add(y, end, "─" * max(0, width - end - 2), self.style("rule"))
+        else:
+            self.add(y, 1, "─" * (width - 3), self.style("rule"))
+
+    def hints(self, y: int, pairs, right: int) -> None:
+        """Key hints from the left, as many as fit before column right."""
+        x = 1
+        for key, label in pairs:
+            seg = [(key, "accent"), (" " + label, "muted")]
+            if x + self.span(seg) > right:
+                break
+            x = self.put(y, x, seg) + 3
+
+    def brand(self, trail: str = "") -> int:
+        x = self.put(0, 1, [("暦", "accent*")]) + 2  # a wide glyph: two cells
+        segs = [("koyomi", "text*")]
+        if trail:
+            segs += [("  ›  ", "faint"), (trail, "text")]
+        return self.put(0, x, segs)
+
     def draw(self) -> None:
         self.screen.erase()
         if self.pager:
             self.draw_pager()
+        elif self.page:
+            self.draw_job_page()
         else:
             self.draw_dashboard()
         self.screen.refresh()
 
-    def draw_dashboard(self) -> None:
-        import curses
+    def body_rows(self, height: int) -> int:
+        return max(1, height - TUI_BODY_TOP - 3)
 
+    def draw_dashboard(self) -> None:
         height, width = self.screen.getmaxyx()
         self.draw_header(width)
         columns = self.layout(width)
-        body_top = 4
-        detail = self.detail_lines() if self.expanded and self.job else []
-        body = max(1, height - body_top - 2 - (len(detail) + 1 if detail else 0))
+        body = self.body_rows(height)
         self.clamp_scroll(body)
-        x = 1
+        x = 2
         for header, _, w in columns:
-            self.add(3, x, header[:w].ljust(w), curses.A_BOLD | curses.A_UNDERLINE)
-            x += w + 1
-        if not self.jobs:
-            empty = (
-                "no jobs match the filter"
-                if self.filter
-                else "no jobs yet — add one with: koyomi add ID --cron '...' -- CMD"
+            self.add(TUI_BODY_TOP - 2, x, header[:w], self.style("faint"))
+            x += w + TUI_GAP
+        self.rule(TUI_BODY_TOP - 1)
+        if not self.loads:
+            self.put(
+                TUI_BODY_TOP + 1,
+                2,
+                [(f"{self.spinner()} ", "cyan"), ("reading the hub…", "muted")],
             )
-            self.add(body_top + 1, 2, empty, self.color("dim"))
+        elif not self.jobs:
+            self.put(TUI_BODY_TOP + 1, 2, [("no jobs yet", "muted")])
+            self.put(
+                TUI_BODY_TOP + 2,
+                2,
+                [
+                    ("add one with  ", "faint"),
+                    ("koyomi add ID --cron '…' -- CMD", "accent"),
+                ],
+            )
         for row, job in enumerate(self.jobs[self.scroll : self.scroll + body]):
-            self.draw_row(body_top + row, columns, job)
-        if detail:
-            y = height - 2 - len(detail) - 1
-            self.add(y, 0, "─" * (width - 1), self.color("dim"))
-            for i, (label, value, color) in enumerate(detail, 1):
-                self.add(y + i, 1, f"{label:<9}", self.color("dim"))
-                self.add(y + i, 11, value, self.color(color))
-        self.draw_footer(height, width)
+            self.draw_row(TUI_BODY_TOP + row, columns, job)
+        hidden = len(self.jobs) - self.scroll - body
+        if hidden > 0:
+            self.put(TUI_BODY_TOP + body, 2, [(f"↓ {hidden} more", "faint")])
+        self.draw_footer(height, DASHBOARD_HINTS)
 
     def draw_header(self, width: int) -> None:
-        import curses
+        self.brand()
+        cur = now()
+        hosts = []
+        for h in self.hosts:
+            if host_live(h, cur):
+                hosts += [("● ", "green"), (h["name"], "muted")]
+            elif h["always_on"]:
+                hosts += [("● ", "red"), (h["name"], "red"), (" down", "red*")]
+            else:
+                hosts += [("○ ", "faint"), (h["name"], "faint"), (" away", "faint")]
+            hosts.append(("   ", "text"))
+        self.put_right(0, width - 2, hosts[:-1])
 
-        run_count = sum(bool(j.get("running")) for j in self.all_jobs)
-        fail_count = sum(
+        active = sum(bool(j.get("running")) for j in self.all_jobs)
+        failing = sum(
             (j.get("last_run") or {}).get("status") in FAILURE_STATES
             for j in self.all_jobs
         )
-        self.fill(0, curses.A_REVERSE)
-        self.add(0, 1, "KOYOMI", curses.A_REVERSE | curses.A_BOLD)
-        cur = now()
-        right = (
-            " · ".join(
-                f"{h['name']} {'up' if host_live(h, cur) else 'DOWN' if h['always_on'] else 'away'}"
-                for h in self.hosts
-            )
-            + " "
-        )
-        self.add(0, max(9, width - len(right) - 1), right, curses.A_REVERSE)
+        total = len(self.all_jobs)
+        enabled = sum(bool(j.get("enabled")) for j in self.all_jobs)
         parts = [
-            (
-                f"{len(self.all_jobs)} job" + ("s" if len(self.all_jobs) != 1 else ""),
-                "",
-            ),
-            (f"{sum(bool(j.get('enabled')) for j in self.all_jobs)} enabled", ""),
-            (f"{run_count} active", "cyan" if run_count else "dim"),
-            (f"{fail_count} failing", "red" if fail_count else "dim"),
-            (f"sort: {self.sort}", "dim"),
+            [(str(total), "text*"), (" job" + ("s" if total != 1 else ""), "muted")],
+            [(str(enabled), "text*"), (" enabled", "muted")],
+            [(str(active), "cyan*"), (" active", "cyan")]
+            if active
+            else [("0 active", "faint")],
+            [(str(failing), "red*"), (" failing", "red")]
+            if failing
+            else [("0 failing", "faint")],
         ]
         if self.unsent:
-            parts.append((f"{self.unsent} alerts not emailed", "red"))
-        x = 1
-        for text, color in parts:
-            self.add(1, x, text, self.color(color))
-            x += len(text) + 3
-        if self.filter or self.mode == "filter":
-            label = f"/{self.filter}" + ("_" if self.mode == "filter" else "")
-            self.add(2, 1, label[: width - 2], self.color("yellow"))
+            parts.append(
+                [
+                    ("▲ ", "red"),
+                    (str(self.unsent), "red*"),
+                    (
+                        " alert" + ("s" if self.unsent != 1 else "") + " not emailed",
+                        "red",
+                    ),
+                ]
+            )
+        x = 2
+        for i, seg in enumerate(parts):
+            if i:
+                x = self.put(2, x, [("  ·  ", "rule")])
+            x = self.put(2, x, seg)
+
+        self.put_right(2, width - 2, [("sort ", "faint"), (self.sort, "muted")])
 
     def layout(self, width: int) -> list[tuple[str, str, int]]:
         """Drop optional columns right-to-left, then fit JOB to the ids on screen."""
         columns = list(TUI_COLUMNS)
         natural = min(28, max(6, *(len(j["id"]) for j in self.jobs), len("JOB")))
         while len(columns) > 2:
-            used = sum(max(w, natural) for _, _, w in columns) + len(columns) + 1
+            used = sum(max(w, natural) for _, _, w in columns)
+            used += TUI_GAP * len(columns) + 2
             if width - used >= 16:
                 break
             columns.pop()
-        fixed = sum(w for _, _, w in columns if w > 0) + len(columns) + 1
+        fixed = sum(w for _, _, w in columns if w > 0) + TUI_GAP * len(columns) + 2
         for i, (header, key, w) in enumerate(columns):
             if w == 0:
                 columns[i] = (header, key, natural)
@@ -2419,179 +2805,498 @@ class TuiApp:
         return columns
 
     def draw_row(self, y: int, columns, job: dict) -> None:
-        import curses
-
         selected = job["id"] == self.selected_id
-        base = curses.A_REVERSE if selected else 0
         if selected:
-            self.fill(y, base)
+            self.fill(y, self.style("text", True))
+            self.add(y, 0, "▌", self.style("accent", True))
         cells = self.row_cells(job)
-        x = 1
+        query = self.typed if self.mode == "search" else self.query
+        x = 2
         for _, key, w in columns:
-            text, color = cells[key]
-            attr = base if selected else self.color(color)
-            self.add(y, x, text[:w].ljust(w), attr)
-            x += w + 1
+            segs = cells[key]
+            if selected and key == "id":
+                segs = [(text, "text*") for text, _ in segs]
+            if key in ("id", "host"):
+                hits = search_ranges(line_text(segs), query)
+                segs = mark(segs, [(a, b, selected) for a, b in hits])
+            self.put(y, x, segs, w, selected)
+            x += w + TUI_GAP
 
-    def row_cells(self, job: dict) -> dict[str, tuple[str, str]]:
+    def row_cells(self, job: dict) -> dict[str, list[tuple[str, str]]]:
         state = job_status_word(job)
+        color, glyph = STATE_STYLES[state]
         last = job.get("last_run") or {}
-        status = last.get("status") or "—"
+        status = last.get("status")
         if job.get("next_run"):
-            nxt, nxt_color = fmt_rel(job["next_run"]), ""
+            nxt = [(fmt_rel(job["next_run"]), "text")]
         elif not job.get("enabled"):
-            nxt, nxt_color = "paused", "dim"
+            nxt = [("paused", "faint")]
         else:
-            nxt, nxt_color = "—", "dim"
+            nxt = [("—", "faint")]
+        if status:
+            run_color, run_glyph = RUN_STYLES.get(status, ("muted", "·"))
+            last_cell = [(f"{run_glyph} ", run_color), (status, run_color)]
+        else:
+            last_cell = [("—", "faint")]
+        schedule = describe_schedule(job)
+        main, _, zone_name = schedule.partition(" (")
+        sched = [(main, "text" if job.get("enabled") else "muted")]
+        if zone_name:
+            sched.append((" " + zone_name.rstrip(")"), "faint"))
         return {
-            "id": (job["id"], "dim" if not job.get("enabled") else ""),
-            "host": (job["host"], "dim"),
-            "state": (state, STATE_COLORS.get(state, "")),
-            "schedule": (describe_schedule(job), "dim"),
-            "next": (nxt, nxt_color),
-            "last": (status, RUN_COLORS.get(status, "dim")),
-            "when": (
-                fmt_rel(last.get("finished_at") or last.get("started_at")) or "—",
-                "dim",
-            ),
+            "id": [(job["id"], "text" if job.get("enabled") else "muted")],
+            "host": [(job["host"], "muted")],
+            "state": [(f"{glyph or self.spinner()} ", color), (state, color)],
+            "schedule": sched,
+            "next": nxt,
+            "last": last_cell,
+            "when": [
+                (
+                    fmt_rel(last.get("finished_at") or last.get("started_at")) or "—",
+                    "muted" if last else "faint",
+                )
+            ],
         }
 
-    def detail_lines(self) -> list[tuple[str, str, str]]:
-        job = self.job
-        assert job is not None
-        last = job.get("last_run") or {}
-        rows = [("command", job["command"], "")]
-        if job.get("description"):
-            rows.append(("about", job["description"], "dim"))
-        rows.append(("where", f"{job['host']}:{job['cwd']}", "dim"))
-        extras = f"catchup {job['catchup']} · timeout {job.get('timeout') or 'none'}"
-        if job.get("env"):
-            extras += f" · env {' '.join(job['env'])}"
-        if job.get("next_run"):
-            extras += f" · next {fmt_time(job['next_run'])}"
-        rows.append(("options", extras, "dim"))
-        if job.get("running"):
-            r = job["running"]
-            since = f" started {fmt_rel(r['started_at'])}" if r["started_at"] else ""
-            rows.append(
-                (
-                    "now",
-                    f"{r['status']} run {r['run_id']} pid {r['pid']}{since}",
-                    "cyan",
-                )
-            )
-        if last:
-            rows.append(
-                (
-                    "last run",
-                    f"{last['status']} exit={last['exit_code']} ({last['trigger']}) "
-                    f"{fmt_time(last['started_at'])}"
-                    + (f" — {last['error']}" if last.get("error") else ""),
-                    RUN_COLORS.get(last["status"], ""),
-                )
-            )
-        return rows
-
-    def draw_footer(self, height: int, width: int) -> None:
-        import curses
-
+    def draw_footer(self, height: int, hints) -> None:
+        _, width = self.screen.getmaxyx()
         if self.mode == "confirm" and self.confirm:
-            self.fill(height - 2, self.color("red") | curses.A_REVERSE)
-            self.add(
+            question, _, tone = self.confirm
+            self.put(
                 height - 2,
                 1,
-                f"{self.confirm[0]}  [y/n]",
-                self.color("red") | curses.A_REVERSE | curses.A_BOLD,
+                [
+                    ("? ", f"{tone}*"),
+                    (question, f"{tone}*"),
+                    ("   y", "accent"),
+                    (" yes  ", "muted"),
+                    ("n", "accent"),
+                    (" no", "muted"),
+                ],
             )
         elif self.message:
             text, color, at = self.message
             if time.monotonic() - at > 6:
                 self.message = None
             else:
-                self.add(height - 2, 1, text, self.color(color) | curses.A_BOLD)
-        hint = (
-            "type to filter · Enter keep · Esc clear"
-            if self.mode == "filter"
-            else "j/k move · Enter detail · e toggle · r run · l log · "
-            "h history · / filter · ? help · q quit"
+                self.put(height - 2, 1, [("› ", "faint"), (text, color)], width - 3)
+        if self.mode == "search":  # the prompt takes the hints' place, as in vim
+            self.put(
+                height - 1, 1, [("/", "accent*"), (self.typed, "text"), ("▏", "accent")]
+            )
+            if self.typed:
+                count = self.match_count()
+                self.put_right(height - 1, width - 2, count or [("no match", "red")])
+            return
+        right = []
+        if self.query and ("/", "search") in hints:
+            right = [("/", "accent"), (self.query, "yellow"), ("  ", "text")]
+            right += self.match_count() or [("no match", "red")]
+            hints = [*hints[:-2], ("n/N", "next/prev"), *hints[-2:]]
+        self.hints(height - 1, hints, width - 2 - self.span(right) - 3)
+        self.put_right(height - 1, width - 2, right)
+
+    def match_count(self) -> list[tuple[str, str]]:
+        """ "3 of 17" for the search on screen; [] when nothing matches."""
+        if self.pager:
+            total, n = len(self.pager_matches()), self.pager["match"]
+        else:
+            matches = self.job_matches()
+            total = len(matches)
+            n = matches.index(self.index) if self.index in matches else None
+        if not total:
+            return []
+        return [
+            (str(n + 1) if n is not None else "–", "muted"),
+            (f" of {total}", "faint"),
+        ]
+
+    # ------------------------------------------------------------- job page
+
+    @property
+    def page_job(self) -> dict | None:
+        assert self.page is not None
+        return next((j for j in self.all_jobs if j["id"] == self.page["job_id"]), None)
+
+    @property
+    def page_run(self) -> dict | None:
+        """The picked run; None as the pick means the newest, whichever it is."""
+        assert self.page is not None
+        runs, picked = self.page["runs"], self.page["run_id"]
+        return next((r for r in runs if r["run_id"] == picked), None) or (
+            runs[0] if runs else None
         )
-        self.fill(height - 1, curses.A_REVERSE)
-        self.add(height - 1, 1, hint[: width - 2], curses.A_REVERSE)
 
-    # ---------------------------------------------------------------- pager
-
-    def open_pager(self, title: str, source, follow: bool = False) -> None:
+    def open_job(self, job_id: str) -> None:
         try:
-            lines = source()
+            runs = self.load_runs(job_id)
         except KoyomiError as e:
             self.notify(str(e), "red")
             return
+        self.page = {"job_id": job_id, "runs": runs, "run_id": None, "scroll": 0}
+
+    def move_run(self, delta: int) -> None:
+        assert self.page is not None
+        runs = self.page["runs"]
+        if runs:
+            i = runs.index(self.page_run) + delta
+            i = max(0, min(i, len(runs) - 1))
+            self.page["run_id"] = runs[i]["run_id"] if i else None
+
+    def fetch_preview(self) -> None:
+        """Fetch the tail of the picked run's log unless the cached one is current."""
+        run = self.page_run if self.page and not self.pager else None
+        if not run:
+            return
+        job_id, run_id, status = run["job_id"], run["run_id"], run["status"]
+        cached = self.logs.get((job_id, run_id))
+        if (
+            cached
+            and cached["status"] == status
+            and (status not in ACTIVE_STATES or cached["loads"] == self.loads)
+        ):
+            return
+        loads = self.loads
+        self.worker.submit(
+            ("preview", job_id, run_id),
+            lambda: (
+                status,
+                loads,
+                hub("log", job_id=job_id, run_id=run_id, lines=PREVIEW_LINES),
+            ),
+        )
+
+    @staticmethod
+    def run_when(run: dict) -> str:
+        t = parse_iso(run["started_at"] or run["created_at"])
+        return t.astimezone().strftime("%b %d %H:%M")
+
+    @staticmethod
+    def run_duration(run: dict) -> str:
+        if run["duration_seconds"] is not None:
+            return fmt_dur(run["duration_seconds"])
+        if run["status"] == "running" and run["started_at"]:
+            return fmt_dur((now() - parse_iso(run["started_at"])).total_seconds())
+        return "—"
+
+    def run_glyph(self, run: dict) -> tuple[str, str]:
+        color, glyph = RUN_STYLES.get(run["status"], ("muted", "·"))
+        return (self.spinner() if run["status"] == "running" else glyph), color
+
+    def job_facts(self, job: dict) -> list[tuple[str, list[tuple[str, str]]]]:
+        main, _, zone_name = describe_schedule(job).partition(" (")
+        schedule = [(main, "text")]
+        if zone_name:
+            schedule.append((" " + zone_name.rstrip(")"), "faint"))
+        if job.get("next_run"):
+            schedule += [
+                ("   next ", "faint"),
+                (fmt_rel(job["next_run"]), "text"),
+                (f"  {fmt_time(job['next_run'])}", "faint"),
+            ]
+        elif not job.get("enabled"):
+            schedule.append(("   paused", "yellow"))
+        where = [
+            (f"{job['host']}:{job['cwd']}", "muted"),
+            ("   timeout ", "faint"),
+            (str(job.get("timeout") or "none"), "muted"),
+            ("   catchup ", "faint"),
+            (job["catchup"], "muted"),
+        ]
+        if job.get("env"):
+            where += [("   env ", "faint"), (" ".join(job["env"]), "muted")]
+        facts = [
+            ("command", [("$ ", "accent"), (job["command"], "text")]),
+            ("schedule", schedule),
+            ("where", where),
+        ]
+        if job.get("description"):
+            facts.insert(0, ("about", [(job["description"], "text")]))
+        return facts
+
+    def draw_job_page(self) -> None:
+        assert self.page is not None
+        height, width = self.screen.getmaxyx()
+        job = self.page_job
+        if job is None:  # deleted; reload() closes the page
+            return
+        self.brand(job["id"])
+        state = job_status_word(job)
+        color, glyph = STATE_STYLES[state]
+        self.put_right(
+            0, width - 2, [(f"{glyph or self.spinner()} ", color), (state, color)]
+        )
+        y = 2
+        for label, segments in self.job_facts(job):
+            self.put(y, 2, [(f"{label:>8}", "faint")])
+            self.put(y, 12, segments, width - 14)
+            y += 1
+        top, bottom = y + 1, height - 3  # panes fill the rows between
+        if width >= 100:
+            self.draw_runs(top, 2, RUNS_WIDTH, bottom - top + 1)
+            sep = 2 + RUNS_WIDTH + 2
+            for row in range(top, bottom + 1):
+                self.add(row, sep, "│", self.style("rule"))
+            self.draw_run_log(top, sep + 3, width - sep - 5, bottom - top + 1)
+        else:
+            rows = min(len(self.page["runs"]), 5) + 2
+            self.draw_runs(top, 2, width - 4, rows)
+            self.draw_run_log(top + rows + 1, 2, width - 4, bottom - top - rows)
+        self.draw_footer(height, JOB_HINTS)
+
+    def draw_runs(self, top: int, x: int, width: int, height: int) -> None:
+        assert self.page is not None
+        runs = self.page["runs"]
+        self.put(top, x, [("RUNS", "faint"), (f"  {len(runs)}", "faint")])
+        self.add(top + 1, x, "─" * width, self.style("rule"))
+        if not runs:
+            self.put(top + 2, x, [("no runs yet", "muted")])
+            self.put(top + 3, x, [("r", "accent"), (" runs it now", "faint")])
+            return
+        body = max(1, height - 2)
+        picked = runs.index(self.page_run)
+        scroll = max(0, min(self.page["scroll"], len(runs) - body))
+        scroll = min(scroll, picked)
+        scroll = max(scroll, picked - body + 1)
+        self.page["scroll"] = scroll
+        for row, run in enumerate(runs[scroll : scroll + body]):
+            y, selected = top + 2 + row, run is runs[picked]
+            if selected:
+                self.add(y, x - 2, " " * (width + 2), self.style("text", True))
+                self.add(y, x - 2, "▌", self.style("accent", True))
+            glyph, color = self.run_glyph(run)
+            segments = [
+                (f"{glyph} ", color),
+                (self.run_when(run), "text*" if selected else "text"),
+                (f"  {self.run_duration(run):>7}", "muted"),
+                (f"  {run['trigger']}", "faint"),
+            ]
+            self.put(y, x, segments, width, selected)
+
+    def draw_run_log(self, top: int, x: int, width: int, height: int) -> None:
+        run = self.page_run
+        if run is None or height < 3:
+            return
+        glyph, color = self.run_glyph(run)
+        head = [(f"{glyph} ", color), (run["status"], f"{color}*")]
+        if run["exit_code"] is not None:
+            head += [("   exit ", "faint"), (str(run["exit_code"]), "text")]
+        head += [
+            ("   ", "text"),
+            (self.run_duration(run), "text"),
+            ("   ", "text"),
+            (run["trigger"], "muted"),
+            ("   ", "text"),
+            (fmt_time(run["started_at"] or run["created_at"]), "muted"),
+            (f"   {run['run_id']}", "faint"),
+        ]
+        self.put(top, x, head, width)
+        y = top + 1
+        if run.get("error"):
+            self.put(y, x, [(run["error"], "red")], width)
+            y += 1
+        self.add(y, x, "─" * width, self.style("rule"))
+        y += 1
+        rows = top + height - y
+        cached = self.logs.get((run["job_id"], run["run_id"]))
+        lines = cached["lines"] if cached else None
+        if lines is None:
+            self.put(y, x, [("loading…", "faint")])
+            return
+        if not lines:
+            empty = {
+                "queued": "waiting for the host to start it",
+                "running": "no output yet",
+            }.get(run["status"], "no output")
+            self.put(y, x, [(empty, "muted")])
+            return
+        if len(lines) > rows:  # show the tail, as the end is what matters
+            earlier = len(lines) - rows + 1
+            more = "+" if len(lines) >= PREVIEW_LINES else ""
+            self.put(
+                y,
+                x,
+                [
+                    (f"↑ {earlier}{more} earlier lines   ", "faint"),
+                    ("⏎", "accent"),
+                    (" full log", "faint"),
+                ],
+            )
+            y, lines = y + 1, lines[-(rows - 1) :]
+        for i, line in enumerate(lines):
+            self.put(y + i, x, line, width)
+
+    # ---------------------------------------------------------------- pager
+
+    def open_pager(self, title: str, kind: str, lines=None, **extra) -> None:
+        """A full-screen view of lines, each a list of (text, style) segments.
+        Without lines it shows "downloading" until the worker delivers them."""
         self.pager = {
             "title": title,
-            "source": source,
-            "lines": lines,
+            "kind": kind,  # "static" | "daemon" | "run"
+            "lines": lines or [],
+            "partial": "",  # a run log's last line, still being written
+            "loading": lines is None,
+            "version": 0,  # bumped when the lines change; keys the match cache
             "scroll": 0,
-            "follow": follow,
+            "follow": False,
+            "match": None,  # index into pager_matches() that n / N landed on
+            **extra,
         }
 
+    def open_run_log(self, run: dict) -> None:
+        active = run["status"] in ACTIVE_STATES
+        self.open_pager(
+            f"{run['job_id']}  ›  {self.run_when(run)}",
+            "run",
+            run=(run["job_id"], run["run_id"]),
+            size=0,
+            active=active,
+            follow=active,
+            decode=codecs.getincrementaldecoder("utf-8")(errors="replace").decode,
+        )
+        self.fetch_run_log()
+
+    def fetch_run_log(self) -> None:
+        """Download the open run log from where the last download ended."""
+        assert self.pager is not None
+        (job_id, run_id), offset = self.pager["run"], self.pager["size"]
+        self.worker.submit(
+            ("log", job_id, run_id),
+            lambda: hub("log", job_id=job_id, run_id=run_id, offset=offset),
+        )
+
+    @staticmethod
+    def append_log(pager: dict, text: str) -> None:
+        *done, pager["partial"] = (pager["partial"] + text).split("\n")
+        pager["lines"].extend(log_segments(line) for line in done)
+        pager["version"] += 1
+
+    def pager_lines(self) -> list:
+        assert self.pager is not None
+        if self.pager["partial"]:
+            return self.pager["lines"] + [log_segments(self.pager["partial"])]
+        return self.pager["lines"]
+
     def page_size(self) -> int:
-        return max(1, self.screen.getmaxyx()[0] - 3)
+        return max(1, self.screen.getmaxyx()[0] - 4)
 
     def draw_pager(self) -> None:
-        import curses
-
         assert self.pager is not None
+        pager = self.pager
         height, width = self.screen.getmaxyx()
-        lines, body = self.pager["lines"], self.page_size()
+        lines, body = self.pager_lines(), self.page_size()
         max_scroll = max(0, len(lines) - body)
-        if self.pager["follow"]:
-            self.pager["scroll"] = max_scroll
-        self.pager["scroll"] = max(0, min(self.pager["scroll"], max_scroll))
-        top = self.pager["scroll"]
-        self.fill(0, curses.A_REVERSE)
-        self.add(0, 1, self.pager["title"], curses.A_REVERSE | curses.A_BOLD)
-        pos = f"{top + 1}-{min(len(lines), top + body)}/{len(lines)} "
-        if self.pager["follow"] and top == max_scroll:
-            pos = "live " + pos
-        self.add(0, max(1, width - len(pos) - 1), pos, curses.A_REVERSE)
-        for i, line in enumerate(lines[top : top + body], 1):
-            self.add(i, 1, line.replace("\t", "    "))
-        if not lines:
-            self.add(2, 2, "(empty)", self.color("dim"))
-        self.fill(height - 1, curses.A_REVERSE)
-        self.add(
-            height - 1,
-            1,
-            "j/k scroll · Ctrl-D/U page · g/G top/end · f follow · q close",
-            curses.A_REVERSE,
-        )
+        if pager["follow"]:
+            pager["scroll"] = max_scroll
+        pager["scroll"] = max(0, min(pager["scroll"], max_scroll))
+        top = pager["scroll"]
+        self.brand(pager["title"])
+        if pager["loading"]:
+            pos = [(f"{self.spinner()} ", "cyan"), ("downloading…", "cyan")]
+        elif not lines:
+            pos = []
+        else:
+            pos = [
+                (f"{top + 1}–{min(len(lines), top + body)}", "muted"),
+                (f" of {len(lines)}", "faint"),
+            ]
+            if pager["follow"] and top == max_scroll:
+                pos = [("● ", "cyan"), ("live", "cyan"), ("   ", "text")] + pos
+        self.put_right(0, width - 2, pos)
+        self.rule(1)
+        hits: dict[int, list] = {}
+        for n, (li, start, end) in enumerate(self.pager_matches()):
+            if top <= li < top + body:
+                hits.setdefault(li, []).append((start, end, n == pager["match"]))
+        for i, line in enumerate(lines[top : top + body]):
+            self.put(i + 2, 2, mark(line, hits.get(top + i, [])), width - 4)
+        if not lines and not pager["loading"]:
+            self.put(3, 2, [("nothing here yet", "muted")])
+        self.draw_footer(height, PAGER_HINTS)
+
+    def pager_matches(self) -> list[tuple[int, int, int]]:
+        """Every (line, start, end) the search hits; cached per query and content."""
+        assert self.pager is not None
+        query = self.typed if self.mode == "search" else self.query
+        key = (query, self.pager["version"], self.pager["partial"])
+        if self.pager.get("matches_key") != key:
+            self.pager["matches_key"] = key
+            self.pager["matches"] = [
+                (li, start, end)
+                for li, line in enumerate(self.pager_lines())
+                for start, end in search_ranges(line_text(line), query)
+            ]
+        return self.pager["matches"]
+
+    def current_match(self) -> tuple[int, int, int] | None:
+        assert self.pager is not None
+        matches, n = self.pager_matches(), self.pager["match"]
+        return matches[n] if n is not None and n < len(matches) else None
+
+    def show_match(self, n: int | None) -> None:
+        """Land on match n, scrolling it into view a third of the way down."""
+        assert self.pager is not None
+        self.pager["match"] = n
+        if n is None:
+            return
+        line = self.pager_matches()[n][0]
+        top, body = self.pager["scroll"], self.page_size()
+        if not top <= line < top + body:
+            self.pager["scroll"] = max(0, line - body // 3)
+        self.pager["follow"] = False
+
+    def pager_step(self, forward: bool, origin: tuple[int, int] | None = None) -> None:
+        """n / N: the next match after the current one (or after origin), wrapping."""
+        assert self.pager is not None
+        matches = self.pager_matches()
+        if not matches:
+            self.pager["match"] = None
+            return
+        if origin is None:
+            here = self.current_match()
+            origin = here[:2] if here else (self.pager["scroll"], -1)
+        n = step_to(matches, origin, forward, key=lambda m: m[:2])
+        self.show_match(n)
 
     def handle_pager_key(self, key: int) -> None:
         import curses
 
         assert self.pager is not None
-        body = self.page_size()
+        pager, body = self.pager, self.page_size()
+        if key == 27 and self.query:
+            self.query, pager["match"] = "", None
+            return
         if key in (ord("q"), 27, curses.KEY_LEFT):
             self.pager = None
             return
-        if key in (curses.KEY_DOWN, ord("j")):
-            self.pager["scroll"] += 1
-            self.pager["follow"] = False
-        elif key in (curses.KEY_UP, ord("k")):
-            self.pager["scroll"] -= 1
-            self.pager["follow"] = False
-        elif key in (curses.KEY_NPAGE, 4):  # Ctrl-D
-            self.pager["scroll"] += body
-            self.pager["follow"] = False
-        elif key in (curses.KEY_PPAGE, 21):  # Ctrl-U
-            self.pager["scroll"] -= body
-            self.pager["follow"] = False
+        if pager["loading"]:
+            return  # nothing to move through yet
+        moves = {
+            curses.KEY_DOWN: 1,
+            ord("j"): 1,
+            curses.KEY_UP: -1,
+            ord("k"): -1,
+            curses.KEY_NPAGE: body,
+            4: body,  # Ctrl-D
+            curses.KEY_PPAGE: -body,
+            21: -body,  # Ctrl-U
+        }
+        if key in moves:
+            pager["scroll"] += moves[key]
+            pager["follow"] = False
         elif key in (ord("g"), curses.KEY_HOME):
-            self.pager["scroll"], self.pager["follow"] = 0, False
+            pager["scroll"], pager["follow"] = 0, False
         elif key in (ord("G"), curses.KEY_END):
-            self.pager["scroll"] = len(self.pager["lines"])
+            pager["scroll"] = len(self.pager_lines())
         elif key == ord("f"):
-            self.pager["follow"] = not self.pager["follow"]
+            pager["follow"] = not pager["follow"]
+        elif key == ord("/"):
+            self.start_search(pager["scroll"])
+        elif key in (ord("n"), ord("N")) and self.query:
+            self.pager_step(key == ord("n"))
+            if pager["match"] is None:
+                self.notify(f"no match for {self.query}", "yellow")
         elif key == 12:
             self.screen.clear()
 
@@ -2611,11 +3316,11 @@ class TuiApp:
 
     def handle_key(self, key: int) -> bool:
         """Returns True to quit."""
+        if self.mode == "search":
+            self.handle_search_key(key)
+            return False
         if self.pager:
             self.handle_pager_key(key)
-            return False
-        if self.mode == "filter":
-            self.handle_filter_key(key)
             return False
         if self.mode == "confirm":
             assert self.confirm is not None
@@ -2624,64 +3329,20 @@ class TuiApp:
             if key in (ord("y"), ord("Y")):
                 self.guard(action)  # type: ignore[arg-type]
             else:
-                self.notify("cancelled", "dim")
+                self.notify("cancelled", "muted")
+            return False
+        if self.page:
+            self.handle_job_key(key)
             return False
         return self.handle_dashboard_key(key)
 
-    def handle_dashboard_key(self, key: int) -> bool:
-        import curses
-
-        job = self.job
-        body = max(1, self.screen.getmaxyx()[0] - 7)
-        if key == ord("q"):
-            return True
-        if key == 27:
-            if self.filter:
-                self.filter = ""
-                self.apply_view()
-            else:
-                return True
-        elif key in (curses.KEY_DOWN, ord("j")):
-            self.move(1)
-        elif key in (curses.KEY_UP, ord("k")):
-            self.move(-1)
-        elif key in (curses.KEY_NPAGE, 4):
-            self.move(body)
-        elif key in (curses.KEY_PPAGE, 21):
-            self.move(-body)
-        elif key in (ord("g"), curses.KEY_HOME):
-            self.move(-len(self.jobs))
-        elif key in (ord("G"), curses.KEY_END):
-            self.move(len(self.jobs))
-        elif key in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
-            self.expanded = not self.expanded
-        elif key == ord("s"):
-            self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
-            self.apply_view()
-        elif key == ord("/"):
-            self.mode = "filter"
-        elif key == ord("?"):
-            self.open_pager(
-                "KEYS",
-                lambda: (
-                    [f"  {k:<14}{d}" for k, d in TUI_KEYS]
-                    + ["", "  State and history come from the hub, same as the CLI."]
-                ),
-            )
+    def handle_common_key(self, key: int, job: dict | None) -> bool:
+        """Keys the job list and the job page share; True when handled."""
+        if key == ord("?"):
+            self.open_pager("keys", "static", self.help_lines())
         elif key == ord("D"):
-            self.open_pager(
-                "SCHEDULER LOG",
-                lambda: hub("daemon_log", lines=500).splitlines(),
-                True,
-            )
-        elif key == ord("l") and job:
-            self.open_pager(
-                f"LOG · {job['id']}", lambda i=job["id"]: self.log_lines(i), True
-            )
-        elif key == ord("h") and job:
-            self.open_pager(
-                f"HISTORY · {job['id']}", lambda i=job["id"]: self.history_lines(i)
-            )
+            self.open_pager("scheduler log", "daemon", follow=True)
+            self.reload()
         elif key == ord("e") and job:
             self.guard(
                 lambda: self.notify(
@@ -2699,50 +3360,163 @@ class TuiApp:
                 )
             )
         elif key == ord("r") and job:
-            self.guard(
-                lambda: self.notify(
-                    f"{job['id']}: queued run {hub('queue_run', job_id=job['id'])['run_id']} "
-                    f"on {job['host']}",
-                    "cyan",
-                )
-            )
+            self.ask(f"run {job['id']} now on {job['host']}?", "yellow", self.run_now)
         elif key == ord("x") and job:
             self.ask(
                 f"stop the active run of {job['id']}?",
+                "red",
                 lambda: self.notify(
                     f"{job['id']}: stopping {hub('request_stop', job_id=job['id'])}",
                     "yellow",
                 ),
             )
+        elif key == 12:  # Ctrl-L
+            self.screen.clear()
+        else:
+            return False
+        return True
+
+    def run_now(self) -> None:
+        job = self.page_job if self.page else self.job
+        assert job is not None
+        run_id = hub("queue_run", job_id=job["id"])["run_id"]
+        self.notify(f"{job['id']}: queued run {run_id} on {job['host']}", "cyan")
+        if self.page:
+            self.page["run_id"] = None  # follow the new run
+
+    def handle_dashboard_key(self, key: int) -> bool:
+        import curses
+
+        job = self.job
+        if self.handle_common_key(key, job):
+            return False
+        if key == ord("q"):
+            return True
+        if key == 27:
+            if not self.query:
+                return True
+            self.query = ""
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.move(1)
+        elif key in (curses.KEY_UP, ord("k")):
+            self.move(-1)
+        elif key in (curses.KEY_NPAGE, 4):
+            self.move(self.body_rows(self.screen.getmaxyx()[0]))
+        elif key in (curses.KEY_PPAGE, 21):
+            self.move(-self.body_rows(self.screen.getmaxyx()[0]))
+        elif key in (ord("g"), curses.KEY_HOME):
+            self.move(-len(self.jobs))
+        elif key in (ord("G"), curses.KEY_END):
+            self.move(len(self.jobs))
+        elif key in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT) and job:
+            self.open_job(job["id"])
+        elif key == ord("s"):
+            self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
+            self.apply_view()
+        elif key == ord("/"):
+            self.start_search(self.index)
+        elif key in (ord("n"), ord("N")) and self.query:
+            if not self.job_step(key == ord("n")):
+                self.notify(f"no job matches {self.query}", "yellow")
         elif key == ord("d") and job:
             self.ask(
                 f"delete {job['id']} and its run history?",
+                "red",
                 lambda: self.notify(
                     f"deleted {hub('delete_job', job_id=job['id'], keep_logs=False)['id']}",
                     "red",
                 ),
             )
-        elif key == 12:  # Ctrl-L
-            self.screen.clear()
         return False
 
-    def handle_filter_key(self, key: int) -> None:
+    def handle_job_key(self, key: int) -> None:
         import curses
 
-        if key == 27:
-            self.filter, self.mode = "", None
-        elif key in (10, 13, curses.KEY_ENTER):
-            self.mode = None
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            self.filter = self.filter[:-1]
+        assert self.page is not None
+        if self.handle_common_key(key, self.page_job):
+            return
+        run = self.page_run
+        if key in (ord("q"), 27, curses.KEY_LEFT):
+            self.page = None
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.move_run(1)
+        elif key in (curses.KEY_UP, ord("k")):
+            self.move_run(-1)
+        elif key in (curses.KEY_NPAGE, 4):
+            self.move_run(10)
+        elif key in (curses.KEY_PPAGE, 21):
+            self.move_run(-10)
+        elif key in (ord("g"), curses.KEY_HOME):
+            self.page["run_id"] = None
+        elif key in (ord("G"), curses.KEY_END):
+            self.move_run(len(self.page["runs"]))
+        elif key in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT, ord("l")) and run:
+            self.open_run_log(run)
+
+    @staticmethod
+    def help_lines() -> list[list[tuple[str, str]]]:
+        lines: list[list[tuple[str, str]]] = []
+        for section, keys in TUI_KEYS:
+            lines += [[(section.upper(), "faint")]]
+            lines += [[(f"  {k:<14}", "accent"), (d, "text")] for k, d in keys]
+            lines.append([])
+        return lines + [
+            [("State and history come from the hub, same as the CLI.", "muted")]
+        ]
+
+    # ---------------------------------------------------------------- search
+
+    def start_search(self, origin: int) -> None:
+        """Open the "/" prompt; origin is the job index or log line it starts at."""
+        self.mode, self.typed, self.origin = "search", "", origin
+
+    def handle_search_key(self, key: int) -> None:
+        import curses
+
+        if key in (10, 13, curses.KEY_ENTER):
+            self.mode, self.query = None, self.typed
+            return
+        if key == 27 or (key in (curses.KEY_BACKSPACE, 127, 8) and not self.typed):
+            self.mode, self.query = None, ""
+            if self.pager:
+                self.pager["scroll"], self.pager["match"] = self.origin, None
+            elif self.jobs:
+                self.selected_id = self.jobs[min(self.origin, len(self.jobs) - 1)]["id"]
+            return
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            self.typed = self.typed[:-1]
         elif 32 <= key < 127:
-            self.filter += chr(key)
+            self.typed += chr(key)
         else:
             return
-        self.apply_view()
+        # incremental: the first match from where the search started
+        if self.pager:
+            self.pager["scroll"] = self.origin
+            self.pager_step(True, origin=(self.origin, -1))
+        elif self.jobs:
+            self.selected_id = self.jobs[min(self.origin, len(self.jobs) - 1)]["id"]
+            self.job_step(True, origin=self.origin - 1)
 
-    def ask(self, question: str, action) -> None:
-        self.mode, self.confirm, self.message = "confirm", (question, action), None
+    def job_matches(self) -> list[int]:
+        query = self.typed if self.mode == "search" else self.query
+        return [
+            i
+            for i, job in enumerate(self.jobs)
+            if search_ranges(self.haystack(job), query)
+        ]
+
+    def job_step(self, forward: bool, origin: int | None = None) -> bool:
+        """n / N on the job list: select the next matching job, wrapping."""
+        matches = self.job_matches()
+        if not matches:
+            return False
+        i = step_to(matches, self.index if origin is None else origin, forward, int)
+        self.selected_id = self.jobs[matches[i]]["id"]
+        return True
+
+    def ask(self, question: str, tone: str, action) -> None:
+        self.mode, self.message = "confirm", None
+        self.confirm = (question, action, tone)
 
     def guard(self, action) -> None:
         try:
@@ -2750,23 +3524,6 @@ class TuiApp:
         except KoyomiError as e:
             self.notify(str(e), "red")
         self.reload()
-
-    def log_lines(self, job_id: str) -> list[str]:
-        try:
-            out = hub("log", job_id=job_id, run_id=None, lines=500)
-        except KoyomiError as e:
-            return [str(e)]
-        text = base64.b64decode(out["data"]).decode(errors="replace")
-        return text.splitlines() or ["(no output yet)"]
-
-    def history_lines(self, job_id: str) -> list[str]:
-        runs = hub("runs", job_id=job_id, failed=False, limit=200)
-        return [
-            f"  {fmt_time(r['started_at'] or r['created_at'])}  {r['status']:<12} "
-            f"{fmt_dur(r.get('duration_seconds')):>8}  {r['trigger']:<9} "
-            f"{r.get('error') or ''}"
-            for r in reversed(runs)
-        ] or ["no runs recorded yet"]
 
 
 # ---------------------------------------------------------------- cli
