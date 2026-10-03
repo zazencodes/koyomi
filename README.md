@@ -13,7 +13,7 @@ On every machine, from a checkout of this repo:
 ```bash
 uv tool install .                     # the koyomi CLI
 koyomi init HOST ...                  # once: name this host, point it at the hub (below)
-./install.sh                          # CLI + scheduler service + agent skill; re-run after editing the code
+./install.sh                          # CLI + scheduler service; re-run after editing the code
 ```
 
 `koyomi init` stores `~/.koyomi/config.json` (mode 600): the host name, how to reach the hub, and the SMTP settings for alert email (read from a dotenv file with `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`). Alerts go out through Amazon SES from `noreply@alerts.galea.dev`; the credentials file and its setup are in `~/pro/galea.dev-aws-ses-email` (`koyomi-smtp.env`, README section *alerts.galea.dev*).

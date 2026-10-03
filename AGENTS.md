@@ -8,8 +8,8 @@
 ## Repo Shape
 
 - `koyomi.py`: the whole thing. Sections, top to bottom: cron parser; hub state and operations (`op_*`, registered in `HUB_OPS`), which run only on the hub; hub access (`hub()` / `call_hub()`, the `_rpc` server); email alerts; the runner (`execute`, hidden `_exec` subcommand); the host daemon (`host_tick`, `daemon_main`); launchd/systemd management (`service`); CLI commands; TUI.
-- `skill/koyomi/SKILL.md`: global agent skill. `~/.agents/skills/koyomi` and `~/.claude/skills/koyomi` are symlinks to this folder, so edits go live immediately.
-- `install.sh`: `uv tool install --reinstall .` + `koyomi service install` + skill symlinks.
+- `skill/koyomi/SKILL.md`: global agent skill. It is an external skill of the `~/agents` registry (`EXTERNAL_SKILLS` in `~/agents/skills/sync_skills.py`), which symlinks this folder into `~/.agents/skills`, `~/.claude/skills` and Gemini's skills, so edits go live immediately.
+- `install.sh`: `uv tool install --reinstall .` + `koyomi service install`.
 - `tests/test_koyomi.py`: unittest suite.
 
 ## Architecture

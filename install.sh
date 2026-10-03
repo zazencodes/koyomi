@@ -1,19 +1,12 @@
 #!/bin/sh
-# Install (or reinstall) Koyomi on this machine: CLI via uv tool, scheduler service
-# (launchd agent on macOS, systemd unit on Linux), global agent skill.
-# A new machine runs `koyomi init` first (see README.md).
+# Install (or reinstall) Koyomi on this machine: CLI via uv tool and scheduler service
+# (launchd agent on macOS, systemd unit on Linux). A new machine runs `koyomi init` first
+# (see README.md). The agent skill is linked by the ~/agents skills registry, not here.
 set -eu
 cd "$(dirname "$0")"
-REPO="$(pwd)"
 
-uv tool install --reinstall --quiet "$REPO"
+uv tool install --reinstall --quiet .
 KOYOMI="$(uv tool dir --bin)/koyomi"
-
-# global coding-agent skill
-for dir in "$HOME/.agents/skills" "$HOME/.claude/skills"; do
-  mkdir -p "$dir"
-  ln -sfn "$REPO/skill/koyomi" "$dir/koyomi"
-done
 
 # scheduler service (captures the current PATH for scheduled jobs)
 "$KOYOMI" service install
