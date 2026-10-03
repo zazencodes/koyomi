@@ -61,6 +61,8 @@ HOST_DOWN_SECONDS = 180  # unreachable this long -> alert
 RPC_TIMEOUT = 60
 KEEP_RUNS = 50  # run records kept per job
 KEEP_ALERTS = 200  # sent alerts kept
+ALERT_RETRY_SECONDS = 60  # first wait after a failed send; doubles per attempt
+ALERT_RETRY_MAX = 3600  # longest wait between send attempts
 LOG_CHUNK = 1_000_000  # max bytes uploaded per sync
 MIN_INTERVAL = 60
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -600,6 +602,7 @@ def raise_alert(subject: str, body: str) -> None:
             "created_at": iso(cur),
             "sent_at": None,
             "attempts": 0,
+            "last_attempt_at": None,
             "last_error": None,
         },
     )
@@ -626,6 +629,8 @@ def run_alert(rec: dict) -> None:
         rec.get("output_tail") or "(none)",
         "",
         f"Full log: koyomi logs {rec['job_id']} --run {rec['run_id']} -n 0",
+        "",
+        "No further alerts for this job until it succeeds again.",
     ]
     raise_alert(
         f"Koyomi: {rec['job_id']} {rec['status']} on {rec['host']}", "\n".join(lines)
@@ -641,10 +646,12 @@ def record_skip(
     if not job.get("running"):
         job["last_run"] = run_summary(rec)
     log_event(f"{job['id']}: skipped slot {iso(due)}: {reason}")
-    if alert:
+    if alert and not job.get("alerted"):
+        job["alerted"] = True
         raise_alert(
             f"Koyomi: {job['id']} skipped a slot on {job['host']}",
-            f"Job {job['id']} on {job['host']} skipped its {iso(due)} slot: {reason}.",
+            f"Job {job['id']} on {job['host']} skipped its {iso(due)} slot: {reason}.\n"
+            "No further alerts for this job until it succeeds again.",
         )
 
 
@@ -666,10 +673,15 @@ def close_run(job: dict, rec: dict) -> None:
     if (job.get("running") or {}).get("run_id") == rec["run_id"]:
         job["running"] = None
     job["last_run"] = run_summary(rec)
+    alert = rec["status"] in ALERT_STATES and not job.get("alerted")
+    if rec["status"] == "success":
+        job["alerted"] = False
+    elif alert:
+        job["alerted"] = True
     save_job(job)
     error = f" ({rec['error']})" if rec.get("error") else ""
     log_event(f"{job['id']}: run {rec['run_id']} {rec['status']}{error}")
-    if rec["status"] in ALERT_STATES:
+    if alert:
         run_alert(rec)
     prune_runs(job["id"])
 
@@ -839,6 +851,7 @@ def op_add_job(job: dict) -> dict:
         "updated_at": ts,
         "next_run": None,
         "last_run": None,
+        "alerted": False,
         "running": None,
     }
     refresh_next_run(job)
@@ -1107,22 +1120,27 @@ def send_email(cfg: dict, subject: str, body: str) -> None:
         raise KoyomiError(f"sending email failed: {e}") from None
 
 
-def send_pending_alerts(cfg: dict) -> None:
-    """Hub: email unsent alerts. A failure is retried next tick and logged once."""
+def send_pending_alerts(cfg: dict, cur: dt.datetime) -> None:
+    """Hub: email unsent alerts. A failure is retried with backoff and logged once."""
     paths = sorted(alerts_dir().glob("*.json"))
     for path in paths:
         alert = read_json(path)
         if alert["sent_at"]:
             continue
+        last = parse_iso(alert["last_attempt_at"])
+        backoff = min(ALERT_RETRY_SECONDS * 2 ** (alert["attempts"] - 1), ALERT_RETRY_MAX)
+        if last and (cur - last).total_seconds() < backoff:
+            return  # the mail server is the problem; wait before trying again
+        alert.update(attempts=alert["attempts"] + 1, last_attempt_at=iso(cur))
         try:
             send_email(cfg, alert["subject"], alert["body"])
         except KoyomiError as e:
-            if alert["attempts"] == 0:
-                log_event(f"alert {alert['id']}: {e}; retrying every tick")
-            alert.update(attempts=alert["attempts"] + 1, last_error=str(e))
+            if alert["attempts"] == 1:
+                log_event(f"alert {alert['id']}: {e}; retrying with backoff")
+            alert["last_error"] = str(e)
             write_json(path, alert)
             return  # the mail server is the problem; don't hammer it
-        alert.update(sent_at=iso(now()), attempts=alert["attempts"] + 1)
+        alert["sent_at"] = iso(cur)
         write_json(path, alert)
         if alert["attempts"] > 1:
             log_event(f"alert {alert['id']}: sent after {alert['attempts']} attempts")
@@ -1416,7 +1434,7 @@ def daemon_main() -> int:
             runners += host_tick(cfg, info, cur)
             last_ok = cur
             if is_hub:
-                send_pending_alerts(cfg)
+                send_pending_alerts(cfg, cur)
                 check_hosts_down(cfg, cur)
             else:
                 watch.reachable()

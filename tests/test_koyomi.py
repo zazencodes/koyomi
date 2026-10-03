@@ -232,6 +232,27 @@ class SchedulerTests(HubCase):
         self.assertIn("boom", alerts["Koyomi: bad failed on box"]["body"])
         self.assertIn("Koyomi: slow timeout on box", alerts)
 
+    def test_one_alert_per_failure_streak(self):
+        self.add("bad", "--every", "1h", "--cmd", "exit 1")
+        for _ in range(2):
+            self.set_next_run("bad", k.now())
+            self.tick()
+        self.assertEqual(len(self.alerts()), 1)
+        with k.store_lock():
+            job = k.load_job("bad")
+            job["command"] = "true"
+            k.save_job(job)
+        self.set_next_run("bad", k.now())
+        self.tick()
+        self.assertFalse(k.load_job("bad")["alerted"])
+        with k.store_lock():
+            job = k.load_job("bad")
+            job["command"] = "exit 1"
+            k.save_job(job)
+        self.set_next_run("bad", k.now())
+        self.tick()
+        self.assertEqual(len(self.alerts()), 2)
+
     def test_dead_runner_is_reconciled(self):
         self.add("j", "--every", "1h", "--cmd", "true")
         with k.store_lock():
@@ -470,12 +491,15 @@ class RemoteHostTests(HubCase):
 class AlertTests(HubCase):
     def test_pending_alerts_are_sent_and_retried(self):
         k.raise_alert("one", "body")
+        cur = k.now()
         with mock.patch.object(k, "send_email", side_effect=k.KoyomiError("smtp down")):
-            k.send_pending_alerts(k.load_config())
+            k.send_pending_alerts(k.load_config(), cur)
         alert = self.alerts()[0]
         self.assertEqual((alert["sent_at"], alert["last_error"]), (None, "smtp down"))
         with mock.patch.object(k, "send_email") as send:
-            k.send_pending_alerts(k.load_config())
+            k.send_pending_alerts(k.load_config(), cur + dt.timedelta(seconds=30))
+            send.assert_not_called()  # still backing off
+            k.send_pending_alerts(k.load_config(), cur + dt.timedelta(seconds=61))
             send.assert_called_once_with(k.load_config(), "one", "body")
         self.assertIsNotNone(self.alerts()[0]["sent_at"])
 

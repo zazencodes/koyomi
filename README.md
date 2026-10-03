@@ -60,7 +60,7 @@ The hub emails an alert when:
 - a job on an always-on host runs a slot late, or skips it with `--catchup skip`
 - another always-on host stops reporting for 3 minutes
 
-A machine that cannot reach the hub for 3 minutes emails that itself. Stopping a run with `koyomi stop` is not an alert. Unsent alerts are retried every tick and shown by `koyomi status`.
+A job alerts once per failure streak: after a failed, timed-out, interrupted or skipped run it stays quiet until a run succeeds. A machine that cannot reach the hub for 3 minutes emails that itself. Stopping a run with `koyomi stop` is not an alert. A failed send is retried after a minute, then with the wait doubling up to an hour; unsent alerts are shown by `koyomi status`.
 
 ## When something is down
 

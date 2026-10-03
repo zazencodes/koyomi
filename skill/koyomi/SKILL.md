@@ -12,7 +12,8 @@ through the CLI (on PATH).
 
 - `emanator` is always on: jobs run on schedule; a late or missed slot emails an alert.
 - `mac` runs jobs only while awake and online; a slot missed while asleep runs once on wake.
-- Every failed, timed-out or interrupted run emails an alert. There is nothing to opt into.
+- A failed, timed-out or interrupted run emails an alert, once per failure streak (quiet until the
+  job succeeds again). There is nothing to opt into.
 
 ## Workflow
 
