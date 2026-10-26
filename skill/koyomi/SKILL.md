@@ -137,13 +137,21 @@ you the orchestrator.
    deleting or loosening a job (timeout, `|| true`) just to make it pass.
 6. Report per job: the cause, what you changed, whether a rerun passed, what the user must do.
 
-**Orchestrator:** triage every job first (steps 1-2, briefly). Jobs often share a cause (an
-expired login, a down host, a broken PATH): fix it once. Fix quick ones yourself. A job that needs
-real work in its own repo goes to a helper:
-`koyomi fix --agent <your agent> <id> -m "<what you found and what to try>"` opens a pane next to
-yours with an agent in that job's directory, and prints the pane id. One helper per job. Watch
-helpers with `tmux capture-pane -p -t <pane> | tail -40`; a helper that is done waits at its
-prompt. End with one summary of every job for the user.
+**Orchestrator:** you run on a small, quick model, so plan before you fix.
+
+1. Triage every job (fixer steps 1-2, briefly). Jobs often share a cause (an expired login, a
+   down host, a broken PATH) that one fix covers. Judge how hard each job is to fix.
+2. Ask the user which plan to follow, then wait for the answer before changing anything. Offer
+   two or three plans, each naming who fixes which job, for example: you fix every job; you fix
+   the quick ones and helpers take the rest; one helper per job. Recommend one. When the fixes
+   are simple, recommend fixing everything yourself; a helper is only worth it for a job that
+   needs real work in its own repo.
+3. Follow the chosen plan. A helper is
+   `koyomi fix --agent <your agent> <id> -m "<what you found and what to try>"`: it opens a pane
+   next to yours with an agent in that job's directory, and prints the pane id. One helper per
+   job. Watch helpers with `tmux capture-pane -p -t <pane> | tail -40`; a helper that is done
+   waits at its prompt.
+4. End with one summary of every job for the user.
 
 ## Koyomi itself
 

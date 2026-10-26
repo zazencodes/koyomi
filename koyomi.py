@@ -2184,6 +2184,12 @@ FIX_AGENTS = {
     "pi": ["pi"],
     "opencode": ["opencode", "--auto", "--prompt"],
 }
+# flags put after the agent's name when it orchestrates: a small, quick model.
+# An agent missing here orchestrates with its own defaults.
+ORCHESTRATOR_FLAGS = {
+    "claude": ["--model", "claude-opus-5-5", "--effort", "low"],
+    "codex": ["--model", "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"'],
+}
 
 
 def job_failing(job: dict) -> bool:
@@ -2216,7 +2222,8 @@ def fix_prompt(agent: str, host: str, jobs: list[dict], message: str | None) -> 
         prompt = (
             "You are the orchestrator for these Koyomi jobs: "
             f"{'; '.join(describe_failure(j) for j in jobs)}. {skill} "
-            f"Hand a job to a helper agent in a new tmux pane with `koyomi fix --agent {agent} <job>`."
+            "Triage first, then ask the user which plan to follow before fixing anything. "
+            f"A helper agent is `koyomi fix --agent {agent} <job>`."
         )
     prompt += f" You are on host {host}."
     if message:
@@ -2251,10 +2258,13 @@ def cmd_fix(args) -> int:
         and Path(jobs[0]["cwd"]).is_dir()
     ):
         cwd = jobs[0]["cwd"]
-    title = f"fix:{jobs[0]['id']}" if len(jobs) == 1 else "fix:orchestrator"
-    command = shlex.join(
-        FIX_AGENTS[agent] + [fix_prompt(agent, cfg["host"], jobs, args.message)]
-    )
+    argv = FIX_AGENTS[agent]
+    if len(jobs) == 1:
+        title = f"fix:{jobs[0]['id']}"
+    else:
+        title = "fix:orchestrator"
+        argv = argv[:1] + ORCHESTRATOR_FLAGS.get(agent, []) + argv[1:]
+    command = shlex.join(argv + [fix_prompt(agent, cfg["host"], jobs, args.message)])
     inside = "TMUX" in os.environ
     if inside:
         pane = tmux(

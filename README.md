@@ -54,7 +54,7 @@ A job's `--host` defaults to this machine, and `--cwd` is required for a job on 
 
 ## Fixing failed jobs
 
-`koyomi fix` starts a coding agent's interactive UI, in full-auto mode, in a new tmux pane (a new tmux session if you are not in one), with a prompt that sends it to the koyomi skill's "Fixing failed jobs" section. For one job it works in that job's directory; for several it is an orchestrator that can hand jobs to helper agents, each in its own pane, by running `koyomi fix <job>` itself.
+`koyomi fix` starts a coding agent's interactive UI, in full-auto mode, in a new tmux pane (a new tmux session if you are not in one), with a prompt that sends it to the koyomi skill's "Fixing failed jobs" section. For one job it works in that job's directory; for several it is an orchestrator on a small, quick model (Claude: Opus 5.5 at low effort; Codex: `gpt-6.1-sol` at low reasoning; others: their defaults) that triages the jobs, then asks you to pick a plan: fix them all itself, or hand some to helper agents, each in its own pane, by running `koyomi fix <job>` itself.
 
 ```bash
 koyomi fix                          # every failing job

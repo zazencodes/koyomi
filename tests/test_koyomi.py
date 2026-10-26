@@ -730,9 +730,30 @@ class FixTests(HubCase):
         self.assertEqual(self.cli("fix", "--agent", "opencode"), 0)
         keys = self.tmux_calls()[3]
         argv = k.shlex.split(keys[-1])
-        self.assertEqual(argv[:3], ["opencode", "--auto", "--prompt"])
+        self.assertEqual(argv[:-1], ["opencode", "--auto", "--prompt"])
         self.assertIn("orchestrator for these Koyomi jobs: a on box", argv[-1])
+        self.assertIn("ask the user which plan", argv[-1])
         self.assertIn("`koyomi fix --agent opencode <job>`", argv[-1])
+
+    def test_orchestrator_runs_on_a_low_effort_model(self):
+        self.make_failing("a")
+        self.make_failing("b")
+        self.assertEqual(self.cli("fix", "--agent", "claude"), 0)
+        argv = k.shlex.split(self.tmux_calls()[3][-1])
+        self.assertEqual(
+            argv[:-1],
+            [
+                "claude",
+                "--model",
+                "claude-opus-5-5",
+                "--effort",
+                "low",
+                "--dangerously-skip-permissions",
+            ],
+        )
+        self.assertEqual(self.cli("fix", "--agent", "claude", "a"), 0)
+        argv = k.shlex.split(self.tmux_calls()[-2][-1])
+        self.assertEqual(argv[:-1], k.FIX_AGENTS["claude"])  # a helper: defaults
 
     def test_nothing_failing_starts_nothing(self):
         self.add("fine", "--every", "1h", "--cmd", "true")
