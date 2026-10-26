@@ -46,10 +46,22 @@ koyomi logs report         # output of the latest run, each line with its time
 koyomi history --failed    # past runs
 koyomi status              # hosts, scheduler health, failing jobs, unsent alerts
 koyomi tui                 # live terminal dashboard
+koyomi fix                 # a coding agent in tmux fixes the failing jobs
 koyomi disable report      # or: enable, update, delete
 ```
 
 A job's `--host` defaults to this machine, and `--cwd` is required for a job on another host. `--cron` and `--at` use the job's `--tz` (default: this machine's zone). A job never runs twice for the same slot and never overlaps itself. If a slot was missed (the host was down, asleep, or could not reach the hub), it runs once when the host is back; `--catchup skip` skips it instead.
+
+## Fixing failed jobs
+
+`koyomi fix` starts a coding agent's interactive UI, in full-auto mode, in a new tmux pane (a new tmux session if you are not in one), with a prompt that sends it to the koyomi skill's "Fixing failed jobs" section. For one job it works in that job's directory; for several it is an orchestrator that can hand jobs to helper agents, each in its own pane, by running `koyomi fix <job>` itself.
+
+```bash
+koyomi fix                          # every failing job
+koyomi fix report -a codex -m "the API key was rotated yesterday"
+```
+
+`--agent` is `claude`, `codex`, `pi` or `opencode`; the default is the first of those installed. The command is typed into the pane's shell, so your shell aliases and functions apply. The agent finds the cause, fixes it, reruns the job when that is safe, and leaves its changes uncommitted.
 
 ## Alerts
 

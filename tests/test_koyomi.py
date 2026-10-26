@@ -672,5 +672,74 @@ class ServiceAndUiTests(HubCase):
         self.assertEqual(k.config_path().stat().st_mode & 0o777, 0o600)
 
 
+class FixTests(HubCase):
+    """`koyomi fix` against a fake tmux that records its calls."""
+
+    def setUp(self):
+        super().setUp()
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        self.calls = self.root / "tmux.calls"
+        for name, script in (
+            (
+                "tmux",
+                f'printf "%s\\0" "$@" >> {self.calls}; printf "\\n" >> {self.calls}; echo %7',
+            ),
+            ("codex", "exit 0"),
+        ):
+            (bin_dir / name).write_text(f"#!/bin/sh\n{script}\n")
+            (bin_dir / name).chmod(0o755)
+        env = {
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "TMUX": "/tmp/t,1,0",
+            "TMUX_PANE": "%1",
+        }
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tmux_calls(self):
+        if not self.calls.exists():
+            return []
+        return [line.split("\0")[:-1] for line in self.calls.read_text().splitlines()]
+
+    def make_failing(self, job_id):
+        self.add(job_id, "--every", "1h", "--cwd", str(self.root), "--cmd", "exit 3")
+        self.set_next_run(job_id, k.now())
+        self.tick()
+
+    def test_one_failing_job_gets_an_agent_in_its_directory(self):
+        self.add("fine", "--every", "1h", "--cmd", "true")
+        self.make_failing("bad")
+        self.assertEqual(self.cli("fix", "-m", "check\nthe  token"), 0)
+        split, layout, title, keys, enter = self.tmux_calls()
+        self.assertEqual(
+            split[:5], ["split-window", "-t", "%1", "-c", str(self.root.resolve())]
+        )
+        self.assertEqual(title, ["select-pane", "-t", "%7", "-T", "fix:bad"])
+        argv = k.shlex.split(keys[-1])
+        self.assertEqual(argv[:2], k.FIX_AGENTS["codex"])  # the only one installed
+        self.assertIn("Fix the Koyomi job bad on box (last run", argv[-1])
+        self.assertIn('"Fixing failed jobs"', argv[-1])
+        self.assertTrue(argv[-1].endswith("Guidance from the user: check the token"))
+        self.assertEqual(enter, ["send-keys", "-t", "%7", "Enter"])
+
+    def test_several_jobs_get_an_orchestrator(self):
+        self.make_failing("a")
+        self.make_failing("b")
+        self.assertEqual(self.cli("fix", "--agent", "opencode"), 0)
+        keys = self.tmux_calls()[3]
+        argv = k.shlex.split(keys[-1])
+        self.assertEqual(argv[:3], ["opencode", "--auto", "--prompt"])
+        self.assertIn("orchestrator for these Koyomi jobs: a on box", argv[-1])
+        self.assertIn("`koyomi fix --agent opencode <job>`", argv[-1])
+
+    def test_nothing_failing_starts_nothing(self):
+        self.add("fine", "--every", "1h", "--cmd", "true")
+        self.assertEqual(self.cli("fix"), 0)
+        self.assertEqual(self.tmux_calls(), [])
+        self.assertEqual(self.cli("fix", "nope"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

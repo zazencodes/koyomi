@@ -1,6 +1,6 @@
 ---
 name: koyomi
-description: Schedule, inspect and debug jobs on Alex's machines (this Mac and the VPS emanator) with the `koyomi` CLI (cron-like recurring jobs, one-time jobs, run history, logs, failure alerts by email). Use when the user wants something to run later, on a schedule, every N minutes/hours/days, at a specific time, in the cloud, on the server/VPS or on this machine, wants a cloud task or remote job set up, or asks about scheduled/background jobs, cron, launchd or systemd timers, why a scheduled job failed, or deploying/updating Koyomi itself.
+description: Schedule, inspect and debug jobs on Alex's machines (this Mac and the VPS emanator) with the `koyomi` CLI (cron-like recurring jobs, one-time jobs, run history, logs, failure alerts by email). Use when the user wants something to run later, on a schedule, every N minutes/hours/days, at a specific time, in the cloud, on the server/VPS or on this machine, wants a cloud task or remote job set up, or asks about scheduled/background jobs, cron, launchd or systemd timers, why a scheduled job failed, wants failed jobs fixed, was started by `koyomi fix`, or deploying/updating Koyomi itself.
 ---
 
 # Koyomi
@@ -99,6 +99,7 @@ koyomi history [<id>] [--failed] [-n 50] [--json]
 koyomi logs <id>                # output of latest run, lines prefixed with local HH:MM:SS (--run RUN_ID, -n 0 = all)
 koyomi logs --daemon            # scheduling events from every host: starts, skips, catch-ups, alerts
 koyomi tui                      # interactive dashboard (for the user, not for agents)
+koyomi fix [ID...] [-a claude|codex|pi|opencode] [-m "guidance"]   # agent(s) in tmux fix failing jobs
 ```
 
 Run statuses: `queued`, `running`, `success`, `failed` (non-zero exit), `timeout`, `stopped`
@@ -110,6 +111,39 @@ service: `~/Library/LaunchAgents/local.koyomi.scheduler.plist` on the Mac,
 `/etc/systemd/system/koyomi.service` on emanator), a wrong `cwd`, or scripts that expect an
 interactive shell. Reproduce with `koyomi run <id>`. Scheduler process errors are in
 `~/.koyomi/launchd.log` (Mac) and `journalctl -u koyomi` (emanator).
+
+## Fixing failed jobs
+
+`koyomi fix` starts a coding agent in a new tmux pane, in full-auto mode, with a prompt that names
+the jobs and points here. A prompt for one job makes you its fixer. A prompt listing several makes
+you the orchestrator.
+
+**Fixer**, for each job:
+
+1. Gather the facts: `koyomi show <id>`, `koyomi history <id> -n 20` (since when? every run or
+   some?), `koyomi logs <id> -n 0`, and `koyomi logs <id> --run <RUN_ID>` to compare an earlier
+   success. For `interrupted` or scheduling problems, `koyomi logs --daemon`.
+2. Find the cause where the job runs. A job on this host: work in its `cwd`. A job on another host:
+   `ssh <host>` (`ssh emanator`). emanator can't reach the Mac, so for a Mac job seen from
+   emanator, report what the logs show and stop. Reproduce with the scheduler's environment (the
+   service's PATH, `/bin/sh`), not your interactive shell.
+3. Fix the root cause: the job's code, its definition (`koyomi update`), or its environment
+   (a missing tool, secret or login). A one-off cause (network blip, an `interrupted` run after a
+   reboot or sleep) needs no fix; say so.
+4. Rerun with `koyomi run <id>` only when it is worth it: it is the real job, so skip it when a
+   second run would repeat side effects (emails, posts, payments, deploys) or take very long, and
+   use `--detach` for long runs. A successful run ends the job's failure streak.
+5. Leave changes uncommitted unless the user says to commit, push or deploy. Ask before disabling,
+   deleting or loosening a job (timeout, `|| true`) just to make it pass.
+6. Report per job: the cause, what you changed, whether a rerun passed, what the user must do.
+
+**Orchestrator:** triage every job first (steps 1-2, briefly). Jobs often share a cause (an
+expired login, a down host, a broken PATH): fix it once. Fix quick ones yourself. A job that needs
+real work in its own repo goes to a helper:
+`koyomi fix --agent <your agent> <id> -m "<what you found and what to try>"` opens a pane next to
+yours with an agent in that job's directory, and prints the pane id. One helper per job. Watch
+helpers with `tmux capture-pane -p -t <pane> | tail -40`; a helper that is done waits at its
+prompt. End with one summary of every job for the user.
 
 ## Koyomi itself
 

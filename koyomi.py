@@ -40,6 +40,7 @@ import plistlib
 import queue
 import re
 import shlex
+import shutil
 import signal
 import smtplib
 import ssl
@@ -2156,9 +2157,7 @@ def cmd_status(args) -> int:
         print(
             f"next:      {j['id']} on {j['host']} at {fmt_time(j['next_run'])} ({fmt_rel(j['next_run'])})"
         )
-    failing = [
-        j for j in jobs if (j.get("last_run") or {}).get("status") in ALERT_STATES
-    ]
+    failing = [j for j in jobs if job_failing(j)]
     if failing:
         print("failing:")
         for j in failing:
@@ -2172,6 +2171,115 @@ def cmd_status(args) -> int:
         print(
             f"alerts:    {len(unsent)} not emailed yet; last error: {unsent[-1]['last_error']}"
         )
+    return 0
+
+
+# ---------------------------------------------------------------- fixing agents
+
+# agent -> argv that starts its interactive UI in full-auto mode, the prompt
+# appended. Without --agent, `koyomi fix` takes the first one installed.
+FIX_AGENTS = {
+    "claude": ["claude", "--dangerously-skip-permissions"],
+    "codex": ["codex", "--dangerously-bypass-approvals-and-sandbox"],
+    "pi": ["pi"],
+    "opencode": ["opencode", "--auto", "--prompt"],
+}
+
+
+def job_failing(job: dict) -> bool:
+    return (job.get("last_run") or {}).get("status") in ALERT_STATES
+
+
+def installed_fix_agent() -> str:
+    for name, argv in FIX_AGENTS.items():
+        if shutil.which(argv[0]):
+            return name
+    raise KoyomiError(f"no coding agent on PATH (one of: {', '.join(FIX_AGENTS)})")
+
+
+def describe_failure(job: dict) -> str:
+    lr = job.get("last_run")
+    if not lr:
+        return f"{job['id']} on {job['host']} (never run)"
+    error = f": {lr['error']}" if lr.get("error") else ""
+    return (
+        f"{job['id']} on {job['host']} (last run {lr['run_id']} {lr['status']}{error})"
+    )
+
+
+def fix_prompt(agent: str, host: str, jobs: list[dict], message: str | None) -> str:
+    """One line: it is typed into a shell, where a newline would submit early."""
+    skill = 'Load the koyomi skill and follow its "Fixing failed jobs" section.'
+    if len(jobs) == 1:
+        prompt = f"Fix the Koyomi job {describe_failure(jobs[0])}. {skill}"
+    else:
+        prompt = (
+            "You are the orchestrator for these Koyomi jobs: "
+            f"{'; '.join(describe_failure(j) for j in jobs)}. {skill} "
+            f"Hand a job to a helper agent in a new tmux pane with `koyomi fix --agent {agent} <job>`."
+        )
+    prompt += f" You are on host {host}."
+    if message:
+        prompt += f" Guidance from the user: {message}"
+    return " ".join(prompt.split())
+
+
+def tmux(*args: str) -> str:
+    out = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    if out.returncode:
+        raise KoyomiError(f"tmux {args[0]} failed: {out.stderr.strip()}")
+    return out.stdout.strip()
+
+
+def cmd_fix(args) -> int:
+    if not shutil.which("tmux"):
+        raise KoyomiError("koyomi fix needs tmux")
+    cfg = load_config()
+    agent = args.agent or installed_fix_agent()
+    if args.ids:
+        jobs = [hub("job", job_id=i) for i in args.ids]
+    else:
+        jobs = [j for j in hub("jobs") if job_failing(j)]
+        if not jobs:
+            print("no failing jobs")
+            return 0
+    # a single job on this host is fixed in its own directory
+    cwd = str(Path.home())
+    if (
+        len(jobs) == 1
+        and jobs[0]["host"] == cfg["host"]
+        and Path(jobs[0]["cwd"]).is_dir()
+    ):
+        cwd = jobs[0]["cwd"]
+    title = f"fix:{jobs[0]['id']}" if len(jobs) == 1 else "fix:orchestrator"
+    command = shlex.join(
+        FIX_AGENTS[agent] + [fix_prompt(agent, cfg["host"], jobs, args.message)]
+    )
+    inside = "TMUX" in os.environ
+    if inside:
+        pane = tmux(
+            "split-window",
+            "-t",
+            os.environ["TMUX_PANE"],
+            "-c",
+            cwd,
+            "-P",
+            "-F",
+            "#{pane_id}",
+        )
+        tmux("select-layout", "-t", pane, "tiled")
+    else:
+        pane = tmux("new-session", "-d", "-c", cwd, "-P", "-F", "#{pane_id}")
+    tmux("select-pane", "-t", pane, "-T", title)
+    # typed into the pane's login shell, so the user's aliases and secrets apply
+    tmux("send-keys", "-t", pane, "-l", command)
+    tmux("send-keys", "-t", pane, "Enter")
+    print(f"{agent} started in tmux pane {pane} ({title}, {cwd})")
+    if not inside:
+        if not sys.stdout.isatty():
+            print(f"attach with: tmux attach -t {pane}")
+            return 0
+        os.execvp("tmux", ["tmux", "attach", "-t", pane])
     return 0
 
 
@@ -3672,6 +3780,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("status", help="hosts, scheduler health, failing jobs")
     sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser(
+        "fix",
+        help="start a coding agent in tmux to fix failing jobs (several: an orchestrator)",
+    )
+    sp.add_argument("ids", nargs="*", metavar="ID", help="jobs (default: all failing)")
+    sp.add_argument(
+        "-a",
+        "--agent",
+        choices=list(FIX_AGENTS),
+        help="default: the first installed of " + ", ".join(FIX_AGENTS),
+    )
+    sp.add_argument("-m", "--message", help="extra guidance for the agent")
+    sp.set_defaults(func=cmd_fix)
 
     sp = sub.add_parser(
         "tui", aliases=["ui"], help="interactive job dashboard and controls"
