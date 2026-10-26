@@ -54,7 +54,17 @@ A job's `--host` defaults to this machine, and `--cwd` is required for a job on 
 
 ## Fixing failed jobs
 
-`koyomi fix` starts a coding agent's interactive UI, in full-auto mode, in a new tmux pane (a new tmux session if you are not in one), with a prompt that sends it to the koyomi skill's "Fixing failed jobs" section. For one job it works in that job's directory; for several it is an orchestrator on a small, quick model (Claude: Opus 5.5 at low effort; Codex: `gpt-6.1-sol` at low reasoning; others: their defaults) that triages the jobs, then asks you to pick a plan: fix them all itself, or hand some to helper agents, each in its own pane, by running `koyomi fix <job>` itself.
+`koyomi fix` starts a coding agent's interactive UI, in full-auto mode, in a new tmux pane (a new tmux session if you are not in one), with a prompt that sends it to the koyomi skill's "Fixing failed jobs" section. For one job it works in that job's directory; for several it is an orchestrator that triages the jobs, then asks you to pick a plan: fix them all itself, or hand some to helper agents, each in its own pane, by running `koyomi fix <job>` itself.
+
+The orchestrator runs at low effort, on a model hard-coded in `ORCHESTRATOR_FLAGS` in `koyomi.py`:
+
+| Agent | Orchestrator flags |
+| --- | --- |
+| `claude` | `--model claude-opus-5-5 --effort low` |
+| `codex` | `--model gpt-6.1-sol -c model_reasoning_effort="low"` |
+| `pi`, `opencode` | none (their defaults) |
+
+A fixer for one job, including a helper, uses the agent's own defaults.
 
 ```bash
 koyomi fix                          # every failing job

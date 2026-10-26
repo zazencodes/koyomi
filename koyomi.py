@@ -2184,7 +2184,8 @@ FIX_AGENTS = {
     "pi": ["pi"],
     "opencode": ["opencode", "--auto", "--prompt"],
 }
-# flags put after the agent's name when it orchestrates: a small, quick model.
+# flags put after the agent's name when it orchestrates: low effort. Documented
+# in README.md and the skill; keep them in step.
 # An agent missing here orchestrates with its own defaults.
 ORCHESTRATOR_FLAGS = {
     "claude": ["--model", "claude-opus-5-5", "--effort", "low"],

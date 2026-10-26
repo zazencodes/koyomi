@@ -137,7 +137,9 @@ you the orchestrator.
    deleting or loosening a job (timeout, `|| true`) just to make it pass.
 6. Report per job: the cause, what you changed, whether a rerun passed, what the user must do.
 
-**Orchestrator:** you run on a small, quick model, so plan before you fix.
+**Orchestrator:** you run at low effort (Claude: `claude-opus-5-5`, `--effort low`; Codex:
+`gpt-6.1-sol`, `model_reasoning_effort="low"`; pi and opencode: their defaults), so plan before
+you fix. Helpers and single-job fixers use the agent's defaults.
 
 1. Triage every job (fixer steps 1-2, briefly). Jobs often share a cause (an expired login, a
    down host, a broken PATH) that one fix covers. Judge how hard each job is to fix.
