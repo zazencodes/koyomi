@@ -93,10 +93,30 @@ A job alerts once per failure streak: after a failed, timed-out, interrupted or 
 
 `koyomi tui` shows every host's status, every job's state, next run, and last outcome. It reloads from the hub every 2 seconds (`--refresh SECONDS`).
 
+Recent runs shows one segment per recorded run, oldest to newest, for each job
+(up to 50 retained records). `h`/`l` or `←`/`→` select an older/newer segment;
+the details below show its status, historical machine, trigger, duration, exit
+code, local timestamps and error or scheduled slot. `Enter` opens that run on
+the job page. Returning to the newest segment follows new runs as they arrive.
+Scheduling columns appear as terminal width allows; the job page has full facts.
+
+Symbols accompany color: `│` success, `!` failed/timed out/interrupted,
+`▶` running, `○` queued, `/` explicitly skipped, `■` stopped, and `▾` selected.
+Time without a recorded run has no segment. Slots missed during sleep do not
+become failures; catch-up work appears as its actual run.
+
+The compact chart shows actual completions per hour over the preceding 24 hours,
+using retained history across all jobs. Skips and cancellations before execution
+are excluded. Frequent jobs can have less than 24 hours of retained records, so
+this is an activity view of available history. It refreshes with the snapshot;
+it does not extrapolate throughput. Short terminals show the completion count.
+`koyomi tui --reduced-motion` keeps activity indicators static while data refreshes.
+
 | key | action |
 | --- | --- |
 | `j`/`k`, `↑`/`↓`, `g`/`G`, PgUp/PgDn | move the selection |
 | `Enter` | open the job page |
+| `h`/`l`, `←`/`→` | select an older / newer recent run |
 | `e` | enable / disable (an active run keeps going) |
 | `r` | run now on the job's host (asks first) |
 | `x` | stop the active run (asks first) |

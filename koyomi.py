@@ -53,7 +53,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 LABEL = "local.koyomi.scheduler"  # launchd agent (macOS)
 UNIT = "koyomi.service"  # systemd unit (Linux)
 TICK_SECONDS = 5  # scheduler pass interval on every host
@@ -961,12 +961,41 @@ def op_jobs() -> list[dict]:
 
 
 def op_snapshot() -> dict:
-    alerts = [read_json(p) for p in sorted(alerts_dir().glob("*.json"))]
-    return {
-        "hosts": load_hosts(),
-        "jobs": load_jobs(),
-        "unsent_alerts": [a for a in alerts if not a["sent_at"]],
-    }
+    # One consistent view, including historical host identity after a job moves.
+    # Keep command, environment and output out of the dashboard's run payload.
+    keys = (
+        "run_id",
+        "job_id",
+        "host",
+        "trigger",
+        "status",
+        "created_at",
+        "started_at",
+        "finished_at",
+        "scheduled_for",
+        "duration_seconds",
+        "exit_code",
+        "error",
+    )
+    with store_lock():
+        jobs = load_jobs()
+        alerts = [read_json(p) for p in sorted(alerts_dir().glob("*.json"))]
+        recent = {}
+        for job in jobs:
+            runs = load_runs(job["id"])
+            records = runs[-KEEP_RUNS:]
+            active_id = (job.get("running") or {}).get("run_id")
+            active = next((r for r in runs if r["run_id"] == active_id), None)
+            if active and active not in records:
+                records = [active, *records[-(KEEP_RUNS - 1) :]]
+            recent[job["id"]] = [{key: r[key] for key in keys} for r in records]
+        return {
+            "hosts": load_hosts(),
+            "jobs": jobs,
+            "unsent_alerts": [a for a in alerts if not a["sent_at"]],
+            "observed_at": iso(now()),
+            "recent_runs": recent,
+        }
 
 
 def op_runs(job_id: str | None, failed: bool, limit: int) -> list[dict]:
@@ -1131,7 +1160,9 @@ def send_pending_alerts(cfg: dict, cur: dt.datetime) -> None:
         if alert["sent_at"]:
             continue
         last = parse_iso(alert["last_attempt_at"])
-        backoff = min(ALERT_RETRY_SECONDS * 2 ** (alert["attempts"] - 1), ALERT_RETRY_MAX)
+        backoff = min(
+            ALERT_RETRY_SECONDS * 2 ** (alert["attempts"] - 1), ALERT_RETRY_MAX
+        )
         if last and (cur - last).total_seconds() < backoff:
             return  # the mail server is the problem; wait before trying again
         alert.update(attempts=alert["attempts"] + 1, last_attempt_at=iso(cur))
@@ -2301,8 +2332,8 @@ FAILURE_STATES = ALERT_STATES
 # in "*" is drawn bold. Terminals without 256 colors get plain attributes.
 PALETTE = {
     "text": -1,
-    "muted": 245,
-    "faint": 240,
+    "muted": 249,
+    "faint": 245,
     "rule": 237,
     "accent": 179,
     "green": 114,
@@ -2348,7 +2379,9 @@ def cmd_tui(args) -> int:
         raise KoyomiError("--refresh must be between 0.5 and 60 seconds")
     load_config()
     os.environ.setdefault("ESCDELAY", "25")
-    return curses.wrapper(lambda screen: TuiApp(screen, refresh).run())
+    return curses.wrapper(
+        lambda screen: TuiApp(screen, refresh, args.reduced_motion).run()
+    )
 
 
 # (header, key, width); 0 sizes to content, -1 absorbs the leftover width
@@ -2356,13 +2389,11 @@ TUI_COLUMNS = [
     ("JOB", "id", 0),
     ("HOST", "host", 9),
     ("STATE", "state", 10),
-    ("SCHEDULE", "schedule", -1),
+    ("SCHEDULE", "schedule", 24),
     ("NEXT", "next", 11),
-    ("LAST", "last", 13),
-    ("WHEN", "when", 11),
+    ("RECENT RUNS →", "recent", -1),
 ]
 TUI_GAP = 2
-TUI_BODY_TOP = 6
 TUI_KEYS = [
     (
         "jobs",
@@ -2371,6 +2402,7 @@ TUI_KEYS = [
             ("g / G", "first / last job"),
             ("PgUp / PgDn", "page up / down"),
             ("Enter", "open the job: its runs and their logs"),
+            ("h / l, ← →", "pick an older / newer recorded run"),
             ("e", "enable / disable (an active run keeps going)"),
             ("r", "run now, on the job's host (asks first)"),
             ("x", "stop the active run (asks first)"),
@@ -2405,6 +2437,7 @@ TUI_KEYS = [
 ]
 DASHBOARD_HINTS = [
     ("j/k", "move"),
+    ("h/l", "runs"),
     ("⏎", "open"),
     ("e", "toggle"),
     ("r", "run"),
@@ -2435,6 +2468,42 @@ RUNS_WIDTH = 38  # the run list beside the log on the job page
 PREVIEW_LINES = 200  # log tail fetched for the job page; Enter downloads it all
 QUIET_KEYS = 0.15  # seconds without a key before the job page fetches a preview
 SORTS = ("id", "host", "next", "state")
+
+# Shape as well as color conveys outcomes, including in monochrome terminals.
+RUN_SEGMENTS = {
+    "success": "│",
+    "failed": "!",
+    "timeout": "!",
+    "interrupted": "!",
+    "running": "▶",
+    "queued": "○",
+    "skipped": "/",
+    "stopped": "■",
+}
+
+
+def completion_bins(recent_runs: dict, observed_at: str) -> list[int]:
+    """Actual finishes in the past 24 hours, in hourly buckets, oldest first.
+
+    Retention is bounded per job. Queued cancellations and explicit skipped
+    slots are records, but did not execute and must not inflate completions.
+    """
+    end = parse_iso(observed_at)
+    start = end - dt.timedelta(hours=24)
+    counts = [0] * 24
+    for runs in recent_runs.values():
+        for run in runs:
+            if (
+                run["status"] in ACTIVE_STATES | {"skipped"}
+                or not run["started_at"]
+                or not run["finished_at"]
+            ):
+                continue
+            finished = parse_iso(run["finished_at"])
+            if start <= finished <= end:
+                index = min(23, int((finished - start).total_seconds() // 3600))
+                counts[index] += 1
+    return counts
 
 
 DAEMON_LOG_LINES = 500
@@ -2534,11 +2603,15 @@ class HubWorker:
 class TuiApp:
     """Small curses dashboard over the hub, the same data the CLI shows."""
 
-    def __init__(self, screen, refresh: float):
+    def __init__(self, screen, refresh: float, reduced_motion: bool = False):
         self.screen, self.refresh = screen, refresh
+        self.reduced_motion = reduced_motion
         self.hosts: list[dict] = []
         self.unsent = 0
         self.all_jobs: list[dict] = []
+        self.recent_runs: dict[str, list[dict]] = {}
+        self.observed_at: str | None = None
+        self.picked_runs: dict[str, str] = {}
         self.jobs: list[dict] = []
         self.selected_id: str | None = None
         self.scroll = 0
@@ -2628,11 +2701,14 @@ class TuiApp:
             self.pairs[name, selected] = curses.color_pair(n)
         return attr | self.pairs[name, selected]
 
-    @staticmethod
-    def spinner() -> str:
+    def spinner(self) -> str:
+        if self.reduced_motion:
+            return "●"
         return SPINNER[int(time.monotonic() * 10) % len(SPINNER)]
 
     def animating(self) -> bool:
+        if self.reduced_motion:
+            return False
         if self.pager:
             return self.pager["loading"]
         return not self.loads or any(
@@ -2669,6 +2745,10 @@ class TuiApp:
             snap, job_id, runs = result
             self.loads += 1
             self.hosts, self.all_jobs = snap["hosts"], snap["jobs"]
+            self.recent_runs, self.observed_at = (
+                snap["recent_runs"],
+                snap["observed_at"],
+            )
             self.unsent = len(snap["unsent_alerts"])
             if self.page and not self.page_job:
                 self.notify(f"{self.page['job_id']} no longer exists", "yellow")
@@ -2815,30 +2895,45 @@ class TuiApp:
             self.draw_dashboard()
         self.screen.refresh()
 
+    @staticmethod
+    def dashboard_top(height: int) -> int:
+        return 10 if height >= 28 else 7
+
     def body_rows(self, height: int) -> int:
-        return max(1, height - TUI_BODY_TOP - 3)
+        return max(1, height - self.dashboard_top(height) - 7)
 
     def draw_dashboard(self) -> None:
         height, width = self.screen.getmaxyx()
+        if height < 18 or width < 48:
+            self.put(
+                0,
+                0,
+                [("Koyomi needs a terminal of at least 48 × 18.", "text")],
+                width - 1,
+            )
+            self.put(2, 0, [("Resize the terminal; q quits.", "muted")], width - 1)
+            return
         self.draw_header(width)
+        self.draw_activity(height, width)
         columns = self.layout(width)
+        top = self.dashboard_top(height)
         body = self.body_rows(height)
         self.clamp_scroll(body)
         x = 2
         for header, _, w in columns:
-            self.add(TUI_BODY_TOP - 2, x, header[:w], self.style("faint"))
+            self.add(top - 2, x, header[:w], self.style("faint"))
             x += w + TUI_GAP
-        self.rule(TUI_BODY_TOP - 1)
+        self.rule(top - 1)
         if not self.loads:
             self.put(
-                TUI_BODY_TOP + 1,
+                top,
                 2,
                 [(f"{self.spinner()} ", "cyan"), ("reading the hub…", "muted")],
             )
         elif not self.jobs:
-            self.put(TUI_BODY_TOP + 1, 2, [("no jobs yet", "muted")])
+            self.put(top, 2, [("no jobs yet", "muted")])
             self.put(
-                TUI_BODY_TOP + 2,
+                top + 1,
                 2,
                 [
                     ("add one with  ", "faint"),
@@ -2846,11 +2941,163 @@ class TuiApp:
                 ],
             )
         for row, job in enumerate(self.jobs[self.scroll : self.scroll + body]):
-            self.draw_row(TUI_BODY_TOP + row, columns, job)
+            self.draw_row(top + row, columns, job)
         hidden = len(self.jobs) - self.scroll - body
         if hidden > 0:
-            self.put(TUI_BODY_TOP + body, 2, [(f"↓ {hidden} more", "faint")])
+            self.put(top + body, 2, [(f"↓ {hidden} more", "faint")])
+        self.draw_recent_detail(height - 5, width)
         self.draw_footer(height, DASHBOARD_HINTS)
+
+    def draw_activity(self, height: int, width: int) -> None:
+        if not self.observed_at:
+            return
+        counts = completion_bins(self.recent_runs, self.observed_at)
+        self.put(
+            4,
+            2,
+            [
+                ("Recent runs", "text*"),
+                (f"   {sum(counts)} completed · 24h retained", "muted"),
+            ],
+            width - 4,
+        )
+        self.put(
+            7 if height >= 28 else 3,
+            2,
+            [
+                ("│ ok  ", "green"),
+                ("! failure  ", "red"),
+                ("▶ running  ○ queued  ", "cyan"),
+                ("/ skipped  ■ stopped", "yellow"),
+            ],
+            width - 4,
+        )
+        if height < 28:
+            return
+        # A thin, two-cell braille trace per hour; no fabricated interpolation.
+        peak = max(counts)
+        trace = "⣀⡠⠤⠔⠒⠊⠉⠉"
+        chart = "".join(
+            trace[round(n / peak * 7)] * 2 if peak else "⣀⣀" for n in counts
+        )
+        chart_width = min(48, max(0, width - 34))
+        # At narrow widths keep all 24 buckets in one cell per hour.
+        if chart_width < 48:
+            chart = chart[::2]
+            chart_width = 24
+        self.put(5, 2, [(chart, "text"), (f"   peak {peak}/h", "muted")], width - 4)
+        stamp = parse_iso(self.observed_at).astimezone().strftime("%H:%M %Z")
+        self.put(
+            6,
+            2,
+            [
+                ("−24h", "faint"),
+                (" " * max(1, chart_width - len(stamp) - 4), "text"),
+                (stamp, "muted"),
+                (f"   retained history · up to {KEEP_RUNS}/job", "faint"),
+            ],
+            width - 4,
+        )
+
+    def recent_run(self, job: dict) -> dict | None:
+        runs = self.recent_runs.get(job["id"], [])
+        picked = self.picked_runs.get(job["id"])
+        return next((r for r in runs if r["run_id"] == picked), None) or (
+            runs[-1] if runs else None
+        )
+
+    def move_recent(self, delta: int) -> None:
+        if self.job:
+            runs = self.recent_runs.get(self.job["id"], [])
+            if runs:
+                index = max(
+                    0, min(len(runs) - 1, runs.index(self.recent_run(self.job)) + delta)
+                )
+                if index == len(runs) - 1:
+                    self.picked_runs.pop(self.job["id"], None)  # follow the newest
+                else:
+                    self.picked_runs[self.job["id"]] = runs[index]["run_id"]
+
+    def recent_segments(self, job: dict, width: int) -> list[tuple[str, str]]:
+        runs = self.recent_runs.get(job["id"], [])
+        if not runs:
+            return [("no runs yet", "faint")]
+        capacity = max(1, (width + 1) // 2)
+        picked = self.recent_run(job)
+        index = runs.index(picked)
+        start = min(max(0, len(runs) - capacity), index)
+        end = min(len(runs), start + capacity)
+        segments = []
+        for run in runs[start:end]:
+            color = RUN_STYLES[run["status"]][0]
+            glyph = RUN_SEGMENTS[run["status"]]
+            if job["id"] == self.selected_id and run is picked:
+                glyph = "▾"  # details below correspond to this segment
+                color += "*"
+            segments.extend([(glyph, color), (" ", "text")])
+        return segments[:-1]
+
+    def draw_recent_detail(self, top: int, width: int) -> None:
+        if not self.job or not self.loads:
+            return
+        run = self.recent_run(self.job)
+        if not run:
+            self.put(
+                top,
+                2,
+                [(self.job["id"], "text*"), (" · no recorded runs yet", "muted")],
+                width - 4,
+            )
+            return
+        color = RUN_STYLES[run["status"]][0]
+        runs = self.recent_runs[self.job["id"]]
+        self.put(
+            top,
+            2,
+            [
+                (run["status"], color + "*"),
+                (
+                    f"   {run['host']} · {run['trigger']} · {self.run_duration(run)}",
+                    "text",
+                ),
+                (f"   {runs.index(run) + 1}/{len(runs)} retained", "muted"),
+                (f"   exit {run['exit_code']}", color)
+                if run["exit_code"] is not None
+                else ("", "text"),
+            ],
+            width - 4,
+        )
+        start_label = (
+            "recorded"
+            if run["status"] == "skipped"
+            else "queued"
+            if not run["started_at"]
+            else "started"
+        )
+        start = run["started_at"] or run["created_at"]
+        self.put(
+            top + 1,
+            2,
+            [
+                (f"{start_label} ", "faint"),
+                (fmt_time(start), "text"),
+                ("  →  ", "faint"),
+                (
+                    fmt_time(run["finished_at"])
+                    if run["finished_at"]
+                    else run["status"],
+                    "text",
+                ),
+                (" " + parse_iso(start).astimezone().strftime("%Z"), "muted"),
+            ],
+            width - 4,
+        )
+        detail = run["error"] or (
+            f"slot {fmt_time(run['scheduled_for'])} · {run['run_id']}"
+            if run["scheduled_for"]
+            else run["run_id"]
+        )
+        self.put(top + 2, 2, [(detail, color if run["error"] else "muted")], width - 4)
 
     def draw_header(self, width: int) -> None:
         self.brand()
@@ -2864,7 +3111,8 @@ class TuiApp:
             else:
                 hosts += [("○ ", "faint"), (h["name"], "faint"), (" away", "faint")]
             hosts.append(("   ", "text"))
-        self.put_right(0, width - 2, hosts[:-1])
+        host_x = max(16, width - 2 - self.span(hosts[:-1]))
+        self.put(0, host_x, hosts[:-1], width - host_x - 2)
 
         active = sum(bool(j.get("running")) for j in self.all_jobs)
         failing = sum(
@@ -2898,30 +3146,38 @@ class TuiApp:
         for i, seg in enumerate(parts):
             if i:
                 x = self.put(2, x, [("  ·  ", "rule")])
-            x = self.put(2, x, seg)
+            x = self.put(2, x, seg, max(0, width - 3 - x))
 
-        self.put_right(2, width - 2, [("sort ", "faint"), (self.sort, "muted")])
+        if width >= 100:
+            self.put_right(2, width - 2, [("sort ", "faint"), (self.sort, "muted")])
 
     def layout(self, width: int) -> list[tuple[str, str, int]]:
-        """Drop optional columns right-to-left, then fit JOB to the ids on screen."""
-        columns = list(TUI_COLUMNS)
-        natural = min(28, max(6, *(len(j["id"]) for j in self.jobs), len("JOB")))
-        while len(columns) > 2:
-            used = sum(max(w, natural) for _, _, w in columns)
-            used += TUI_GAP * len(columns) + 2
-            if width - used >= 16:
+        """Always keep job, host and history; add scheduling facts as space allows."""
+        name = min(28, max([8, *(len(j["id"]) for j in self.jobs)]))
+        host = min(16, max([4, *(len(j["host"]) for j in self.jobs)]))
+        columns = [
+            (h, key, name if key == "id" else host if key == "host" else w)
+            for h, key, w in TUI_COLUMNS
+        ]
+
+        def remaining():
+            return (
+                width
+                - 4
+                - TUI_GAP * (len(columns) - 1)
+                - sum(w for _, key, w in columns if key != "recent")
+            )
+
+        for optional in ("schedule", "next", "state"):
+            if remaining() >= 18:
                 break
-            columns.pop()
-        fixed = sum(w for _, _, w in columns if w > 0) + TUI_GAP * len(columns) + 2
-        for i, (header, key, w) in enumerate(columns):
-            if w == 0:
-                columns[i] = (header, key, natural)
-                fixed += natural
-        sched = max((len(describe_schedule(j)) for j in self.jobs), default=10)
-        for i, (header, key, w) in enumerate(columns):
-            if w == -1:
-                columns[i] = (header, key, max(10, min(sched, width - fixed - 1)))
-        return columns
+            columns = [c for c in columns if c[1] != optional]
+        if remaining() < 12:
+            columns[0] = ("JOB", "id", max(6, name - (12 - remaining())))
+        return [
+            (h, key, max(1, remaining()) if key == "recent" else w)
+            for h, key, w in columns
+        ]
 
     def draw_row(self, y: int, columns, job: dict) -> None:
         selected = job["id"] == self.selected_id
@@ -2932,7 +3188,7 @@ class TuiApp:
         query = self.typed if self.mode == "search" else self.query
         x = 2
         for _, key, w in columns:
-            segs = cells[key]
+            segs = self.recent_segments(job, w) if key == "recent" else cells[key]
             if selected and key == "id":
                 segs = [(text, "text*") for text, _ in segs]
             if key in ("id", "host"):
@@ -2944,19 +3200,12 @@ class TuiApp:
     def row_cells(self, job: dict) -> dict[str, list[tuple[str, str]]]:
         state = job_status_word(job)
         color, glyph = STATE_STYLES[state]
-        last = job.get("last_run") or {}
-        status = last.get("status")
         if job.get("next_run"):
             nxt = [(fmt_rel(job["next_run"]), "text")]
         elif not job.get("enabled"):
             nxt = [("paused", "faint")]
         else:
             nxt = [("—", "faint")]
-        if status:
-            run_color, run_glyph = RUN_STYLES.get(status, ("muted", "·"))
-            last_cell = [(f"{run_glyph} ", run_color), (status, run_color)]
-        else:
-            last_cell = [("—", "faint")]
         schedule = describe_schedule(job)
         main, _, zone_name = schedule.partition(" (")
         sched = [(main, "text" if job.get("enabled") else "muted")]
@@ -2968,13 +3217,6 @@ class TuiApp:
             "state": [(f"{glyph or self.spinner()} ", color), (state, color)],
             "schedule": sched,
             "next": nxt,
-            "last": last_cell,
-            "when": [
-                (
-                    fmt_rel(last.get("finished_at") or last.get("started_at")) or "—",
-                    "muted" if last else "faint",
-                )
-            ],
         }
 
     def draw_footer(self, height: int, hints) -> None:
@@ -3047,12 +3289,17 @@ class TuiApp:
         )
 
     def open_job(self, job_id: str) -> None:
-        try:
-            runs = self.load_runs(job_id)
-        except KoyomiError as e:
-            self.notify(str(e), "red")
-            return
-        self.page = {"job_id": job_id, "runs": runs, "run_id": None, "scroll": 0}
+        runs = list(reversed(self.recent_runs.get(job_id, [])))
+        picked = (
+            self.recent_run(self.job) if self.job and self.job["id"] == job_id else None
+        )
+        self.page = {
+            "job_id": job_id,
+            "runs": runs,
+            "run_id": picked["run_id"] if picked else None,
+            "scroll": 0,
+        }
+        self.reload()
 
     def move_run(self, delta: int) -> None:
         assert self.page is not None
@@ -3527,7 +3774,11 @@ class TuiApp:
             self.move(-len(self.jobs))
         elif key in (ord("G"), curses.KEY_END):
             self.move(len(self.jobs))
-        elif key in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT) and job:
+        elif key in (curses.KEY_LEFT, ord("h")):
+            self.move_recent(-1)
+        elif key in (curses.KEY_RIGHT, ord("l")):
+            self.move_recent(1)
+        elif key in (10, 13, curses.KEY_ENTER) and job:
             self.open_job(job["id"])
         elif key == ord("s"):
             self.sort = SORTS[(SORTS.index(self.sort) + 1) % len(SORTS)]
@@ -3580,7 +3831,28 @@ class TuiApp:
             lines += [[(f"  {k:<14}", "accent"), (d, "text")] for k, d in keys]
             lines.append([])
         return lines + [
-            [("State and history come from the hub, same as the CLI.", "muted")]
+            [("State and history come from the hub, same as the CLI.", "muted")],
+            [
+                (
+                    "Recent runs: oldest → newest; one segment per retained record.",
+                    "muted",
+                )
+            ],
+            [("│ success  ! failed/timeout/interrupted  ▶ running  ○ queued", "text")],
+            [("/ skipped  ■ stopped  ▾ selected (details below the job list)", "text")],
+            [
+                (
+                    "Empty time has no segment. Sleep and missing slots are never failures.",
+                    "muted",
+                )
+            ],
+            [
+                (
+                    "Chart: actual finishes/hour over 24h; up to 50 records/job retained.",
+                    "muted",
+                )
+            ],
+            [("Use --reduced-motion for static activity indicators.", "muted")],
         ]
 
     # ---------------------------------------------------------------- search
@@ -3815,6 +4087,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         metavar="SECONDS",
         help="data refresh interval, 0.5–60 seconds (default: 2)",
+    )
+    sp.add_argument(
+        "--reduced-motion",
+        action="store_true",
+        help="use static activity indicators; data still refreshes",
     )
     sp.set_defaults(func=cmd_tui)
 

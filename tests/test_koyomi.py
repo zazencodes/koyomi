@@ -555,6 +555,171 @@ class ServiceAndUiTests(HubCase):
         self.assertIn('Environment="HOME=', unit)
         self.assertIn(" daemon\n", unit)
 
+    def test_snapshot_history_is_per_job_and_preserves_run_host(self):
+        self.add("busy", "--every", "1m", "--cmd", "true")
+        self.add("quiet", "--every", "1h", "--cmd", "true")
+        self.add("empty", "--every", "1h", "--cmd", "true")
+        cur = k.now() - dt.timedelta(hours=2)
+        for job_id, total in (("busy", 55), ("quiet", 1)):
+            for i in range(total):
+                rec = k.new_run_record(
+                    k.load_job(job_id), "manual", cur + dt.timedelta(seconds=i)
+                )
+                rec.update(
+                    host="previous-machine",
+                    status="success",
+                    duration_seconds=1,
+                    finished_at=k.iso(cur + dt.timedelta(seconds=i + 1)),
+                )
+                k.write_json(k.run_json_path(job_id, rec["run_id"]), rec)
+        snap = k.op_snapshot()
+        self.assertEqual(
+            [len(snap["recent_runs"][i]) for i in ("busy", "quiet", "empty")],
+            [50, 1, 0],
+        )
+        records = snap["recent_runs"]["busy"]
+        self.assertEqual(records, sorted(records, key=lambda r: r["run_id"]))
+        self.assertEqual(records[-1]["host"], "previous-machine")
+        self.assertNotIn("env", records[-1])
+        self.assertNotIn("command", records[-1])
+        self.assertIsNotNone(k.parse_iso(snap["observed_at"]))
+
+    def test_snapshot_keeps_active_run_after_many_skipped_slots(self):
+        self.add("j", "--every", "1m", "--cmd", "true")
+        cur = k.now() - dt.timedelta(hours=2)
+        with k.store_lock():
+            job = k.load_job("j")
+            active = k.claim_run(job, "schedule", cur)
+            k.save_job(job)
+            for i in range(60):
+                later = cur + dt.timedelta(minutes=i + 1)
+                k.record_skip(job, "previous run still active", later, later, False)
+        records = k.op_snapshot()["recent_runs"]["j"]
+        self.assertEqual(len(records), 50)
+        self.assertEqual(records[0]["run_id"], active["run_id"])
+        self.assertEqual(records[0]["status"], "running")
+        self.assertTrue(all(r["status"] == "skipped" for r in records[1:]))
+
+    def test_completion_chart_counts_actual_execution_and_time_boundaries(self):
+        end = toronto(2026, 11, 9, 13)
+
+        def rec(status, hours, started=True):
+            return {
+                "status": status,
+                "started_at": k.iso(end) if started else None,
+                "finished_at": k.iso(end - dt.timedelta(hours=hours)),
+            }
+
+        runs = [
+            rec("success", 24),
+            rec("failed", 0),
+            rec("timeout", 1),
+            rec("interrupted", 1),
+            rec("stopped", 1),
+            rec("success", 25),
+            rec("success", -1),
+            rec("skipped", 1),
+            rec("stopped", 1, False),
+            {"status": "queued", "started_at": None, "finished_at": None},
+            {"status": "running", "started_at": k.iso(end), "finished_at": None},
+        ]
+        counts = k.completion_bins({"j": runs}, k.iso(end))
+        self.assertEqual(
+            (len(counts), counts[0], counts[23], sum(counts)), (24, 1, 4, 5)
+        )
+        self.assertEqual(k.completion_bins({}, k.iso(end)), [0] * 24)
+
+    def test_recent_runs_follow_latest_and_open_selected_without_waiting(self):
+        self.add("j", "--every", "1h", "--cmd", "true")
+        app = k.TuiApp(None, 2)
+        app.all_jobs = k.op_jobs()
+        app.apply_view()
+        job = app.job
+        runs = [
+            k.new_run_record(job, "schedule", k.now() + dt.timedelta(seconds=i))
+            for i in range(4)
+        ]
+        runs[0]["status"] = "success"
+        runs[1]["status"] = "skipped"
+        runs[2]["status"] = "failed"
+        app.recent_runs = {"j": runs[:3]}
+        self.assertEqual(app.recent_run(job), runs[2])
+        app.handle_key(ord("h"))
+        self.assertEqual(app.recent_run(job), runs[1])
+        app.recent_runs["j"].append(runs[3])
+        self.assertEqual(app.recent_run(job), runs[1])
+        segments = app.recent_segments(job, 5)  # selected run stays in the window
+        self.assertEqual(k.line_text(segments), "▾ ! ▶")
+        app.worker = mock.Mock()
+        with mock.patch.object(
+            k, "hub", side_effect=AssertionError("UI thread called hub")
+        ):
+            app.handle_key(10)
+        self.assertEqual(app.page["run_id"], runs[1]["run_id"])
+        app.page = None
+        app.move_recent(100)
+        self.assertNotIn("j", app.picked_runs)
+        self.assertEqual(app.recent_run(job), runs[3])
+        app.picked_runs["j"] = "pruned-record"
+        self.assertEqual(app.recent_run(job), runs[3])
+        self.assertEqual(
+            k.line_text(app.recent_segments({"id": "empty"}, 20)), "no runs yet"
+        )
+
+    def test_recent_layout_keeps_identity_and_history(self):
+        self.add("a-long-job-name", "--every", "1h", "--cmd", "true")
+        app = k.TuiApp(None, 2)
+        app.all_jobs = k.op_jobs()
+        app.apply_view()
+        for width in (48, 60, 80, 100, 150, 220):
+            columns = app.layout(width)
+            self.assertTrue(
+                {"id", "host", "recent"}.issubset({key for _, key, _ in columns})
+            )
+            used = sum(w for _, _, w in columns) + k.TUI_GAP * (len(columns) - 1)
+            self.assertLessEqual(used, width - 4)
+            self.assertTrue(all(w > 0 for _, _, w in columns))
+
+    def test_dashboard_renders_before_first_snapshot_and_with_no_jobs(self):
+        screen = mock.Mock(**{"getmaxyx.return_value": (24, 80)})
+        app = k.TuiApp(screen, 2)
+        app.draw()  # loading starts before there are any jobs to size columns
+        self.assertTrue(
+            any(
+                "reading the hub" in call.args[2]
+                for call in screen.addnstr.call_args_list
+            )
+        )
+        screen.reset_mock()
+        app.apply(
+            ("reload",),
+            (
+                {
+                    "jobs": [],
+                    "hosts": [],
+                    "unsent_alerts": [],
+                    "recent_runs": {},
+                    "observed_at": k.iso(k.now()),
+                },
+                None,
+                None,
+            ),
+            None,
+        )
+        app.draw()
+        self.assertTrue(
+            any("no jobs yet" in call.args[2] for call in screen.addnstr.call_args_list)
+        )
+
+    def test_reduced_motion_keeps_data_refresh_and_static_indicators(self):
+        args = k.build_parser().parse_args(["tui", "--reduced-motion"])
+        app = k.TuiApp(None, 2, args.reduced_motion)
+        app.worker = mock.Mock()
+        self.assertFalse(app.animating())
+        self.assertEqual(app.spinner(), "●")
+        app.reload()
+        app.worker.submit.assert_called_once()
+
     def test_tui_sort_and_search(self):
         self.add("beta", "--every", "1h", "--cmd", "true", "--description", "nightly")
         self.add("alpha", "--cron", "@daily", "--cmd", "echo hello")
