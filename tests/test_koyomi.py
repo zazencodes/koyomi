@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import datetime as dt
 import io
 import json
@@ -484,6 +485,30 @@ class RemoteHostTests(HubCase):
         self.assertEqual(unstamp(log), f"{work.resolve()}\nmac\n")
         self.assertEqual(self.alerts(), [])  # a laptop catching up is not an alert
 
+    def test_disabled_alerts_distinguish_hub_and_local_host(self):
+        self.use(self.hub_home)
+        k.write_json(k.config_path(), {"host": "box", "hub": "local"})
+        self.use(self.mac_home)
+
+        for local_email in (True, False):
+            with self.subTest(local_email=local_email):
+                if not local_email:
+                    self.mac_cfg.pop("email")
+                    k.write_json(k.config_path(), self.mac_cfg)
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    self.assertEqual(k.main(["list", "--json"]), 0)
+                self.assertEqual(json.loads(stdout.getvalue()), [])
+                warnings = stderr.getvalue()
+                self.assertIn("email alerts disabled on the hub", warnings)
+                self.assertEqual(
+                    "hub outage emails disabled on this host" in warnings,
+                    not local_email,
+                )
+
     def test_errors_and_version_cross_the_wire(self):
         with self.assertRaisesRegex(k.KoyomiError, "no such job: nope"):
             k.call_hub(self.mac_cfg, "job", {"job_id": "nope"})
@@ -498,6 +523,54 @@ class RemoteHostTests(HubCase):
 
 
 class AlertTests(HubCase):
+    def test_hub_without_smtp_records_failures_without_queueing_alerts(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(k.main(["init", "box", "--hub-local", "--always-on"]), 0)
+        self.assertIn("email alerts disabled", stdout.getvalue())
+        self.assertNotIn("email", k.load_config())
+
+        self.add("failed-job", "--every", "1h", "--cmd", "exit 1")
+        self.set_next_run("failed-job", k.now())
+        self.tick()
+        self.assertEqual(k.load_job("failed-job")["last_run"]["status"], "failed")
+        self.assertEqual(self.alerts(), [])
+
+        stdout = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            mock.patch.object(k, "service_loaded", return_value=False),
+        ):
+            self.assertEqual(k.main(["status"]), 0)
+        self.assertIn("email alerts disabled on the hub", stdout.getvalue())
+        self.assertIn("failed-job on box: failed", stdout.getvalue())
+
+    def test_pending_alerts_are_preserved_when_smtp_is_disabled(self):
+        k.raise_alert("one", "body")
+        cfg = {"host": "box", "hub": "local"}
+        before = self.alerts()
+        watch, cur = k.HubWatch(), k.now()
+        with mock.patch.object(k, "send_email") as send, mock.patch.object(k, "say"):
+            k.send_pending_alerts(cfg, cur)
+            watch.unreachable(cfg, k.HubUnreachable("no route"), cur)
+            watch.unreachable(
+                cfg, k.HubUnreachable("no route"), cur + dt.timedelta(minutes=4)
+            )
+            send.assert_not_called()
+        self.assertEqual(self.alerts(), before)
+        self.assertEqual(watch.error, "no route")
+
+    def test_init_rejects_partial_smtp_settings(self):
+        config_before = k.config_path().read_bytes()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(
+                k.main(["init", "box", "--hub-local", "--email-to", "me@example.com"]),
+                1,
+            )
+        self.assertIn("give --smtp-env, --email-from and --email-to together", stderr.getvalue())
+        self.assertEqual(k.config_path().read_bytes(), config_before)
+
     def test_pending_alerts_are_sent_and_retried(self):
         k.raise_alert("one", "body")
         cur = k.now()
@@ -632,7 +705,7 @@ class ServiceAndUiTests(HubCase):
     def test_recent_runs_follow_latest_and_open_selected_without_waiting(self):
         self.add("j", "--every", "1h", "--cmd", "true")
         app = k.TuiApp(None, 2)
-        app.all_jobs = k.op_jobs()
+        app.all_jobs = k.op_jobs()["jobs"]
         app.apply_view()
         job = app.job
         runs = [
@@ -669,7 +742,7 @@ class ServiceAndUiTests(HubCase):
     def test_recent_layout_keeps_identity_and_history(self):
         self.add("a-long-job-name", "--every", "1h", "--cmd", "true")
         app = k.TuiApp(None, 2)
-        app.all_jobs = k.op_jobs()
+        app.all_jobs = k.op_jobs()["jobs"]
         app.apply_view()
         for width in (48, 60, 80, 100, 150, 220):
             columns = app.layout(width)
@@ -726,7 +799,7 @@ class ServiceAndUiTests(HubCase):
         self.add("gamma", "--every", "2h", "--cmd", "true", "--description", "Nightly")
         self.cli("disable", "alpha")
         app = k.TuiApp(None, 1.0)
-        app.all_jobs = k.op_jobs()
+        app.all_jobs = k.op_jobs()["jobs"]
         app.apply_view()
         self.assertEqual([j["id"] for j in app.jobs], ["alpha", "beta", "gamma"])
         app.sort = "next"  # a disabled job has no next run and sorts last
@@ -795,7 +868,7 @@ class ServiceAndUiTests(HubCase):
     def test_tui_run_asks_first(self):
         self.add("beta", "--every", "1h", "--cmd", "true")
         app = k.TuiApp(None, 1.0)
-        app.all_jobs = k.op_jobs()
+        app.all_jobs = k.op_jobs()["jobs"]
         app.apply_view()
         app.handle_key(ord("r"))
         self.assertEqual(app.mode, "confirm")

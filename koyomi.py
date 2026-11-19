@@ -11,19 +11,17 @@ One machine is the hub. It keeps all state as plain JSON under ~/.koyomi/
   alerts/<alert_id>.json       alert emails, pending until sent
   daemon.log                   scheduler events from every host
 
-Every machine has a config.json (its host name, how to reach the hub, email
-settings) and runs `koyomi daemon` (launchd on macOS, systemd on Linux). Every
-job is pinned to a host. A host's daemon asks the hub for its due runs, runs
-them, and streams their output back. On the hub, hub operations are function
-calls; other machines run the same operations through `ssh <hub> koyomi _rpc`.
-Hosts keep only config.json and a spool of in-progress output.
+Every machine has a config.json with its host name, hub connection and optional
+email settings. It runs `koyomi daemon` (launchd on macOS, systemd on Linux).
+Every job is pinned to a host. That host's daemon asks the hub for due runs,
+executes them, and streams their output back. On the hub, operations are function
+calls. Other machines use `ssh <hub> koyomi _rpc`.
 
 The hub claims a slot by persisting the advanced next_run *before* a runner
 starts, so a slot is never executed twice (at-most-once), and missed slots
-collapse into a single catch-up run after sleep or downtime. The hub emails an
-alert when a run fails, times out or is interrupted, a slot is skipped, an
-always-on host runs a slot late or stops reporting; a machine that cannot
-reach the hub emails that itself.
+collapse into a single catch-up run after sleep or downtime. With SMTP enabled,
+the hub emails alerts for run failures, skipped slots and always-on host issues.
+A host with SMTP configured can email when it loses contact with the hub.
 """
 
 from __future__ import annotations
@@ -53,7 +51,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 LABEL = "local.koyomi.scheduler"  # launchd agent (macOS)
 UNIT = "koyomi.service"  # systemd unit (Linux)
 TICK_SECONDS = 5  # scheduler pass interval on every host
@@ -202,7 +200,7 @@ def zone(name: str) -> ZoneInfo:
         return ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError):
         raise KoyomiError(
-            f"unknown time zone {name!r} (example: America/Toronto)"
+            f"unknown time zone {name!r} (example: Europe/Berlin)"
         ) from None
 
 
@@ -593,6 +591,8 @@ def claim_run(
 
 
 def raise_alert(subject: str, body: str) -> None:
+    if not load_config().get("email"):
+        return
     cur = now()
     alert_id = cur.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     alert_id += "-" + os.urandom(2).hex()
@@ -956,8 +956,8 @@ def op_job(job_id: str) -> dict:
     return load_job(job_id)
 
 
-def op_jobs() -> list[dict]:
-    return load_jobs()
+def op_jobs() -> dict:
+    return {"jobs": load_jobs(), "email_alerts": bool(load_config().get("email"))}
 
 
 def op_snapshot() -> dict:
@@ -992,6 +992,7 @@ def op_snapshot() -> dict:
         return {
             "hosts": load_hosts(),
             "jobs": jobs,
+            "email_alerts": bool(load_config().get("email")),
             "unsent_alerts": [a for a in alerts if not a["sent_at"]],
             "observed_at": iso(now()),
             "recent_runs": recent,
@@ -1154,6 +1155,8 @@ def send_email(cfg: dict, subject: str, body: str) -> None:
 
 def send_pending_alerts(cfg: dict, cur: dt.datetime) -> None:
     """Hub: email unsent alerts. A failure is retried with backoff and logged once."""
+    if not cfg.get("email"):
+        return
     paths = sorted(alerts_dir().glob("*.json"))
     for path in paths:
         alert = read_json(path)
@@ -1185,6 +1188,8 @@ def send_pending_alerts(cfg: dict, cur: dt.datetime) -> None:
 
 def check_hosts_down(cfg: dict, cur: dt.datetime) -> None:
     """Hub: alert once when another always-on host stops reporting."""
+    if not cfg.get("email"):
+        return
     with store_lock():
         for h in load_hosts():
             if not h["always_on"] or h["name"] == cfg["host"] or h.get("down_alerted"):
@@ -1470,7 +1475,11 @@ class HubWatch:
             self.since = cur
             say(f"cannot reach the hub: {error}")
         self.error = str(error)
-        if self.alerted or (cur - self.since).total_seconds() <= HOST_DOWN_SECONDS:
+        if (
+            not cfg.get("email")
+            or self.alerted
+            or (cur - self.since).total_seconds() <= HOST_DOWN_SECONDS
+        ):
             return
         try:
             send_email(
@@ -1822,26 +1831,27 @@ def cmd_init(args) -> int:
         hub_cfg = {"command": ssh_hub_command(args.hub_ssh, args.hub_koyomi)}
     else:
         raise KoyomiError("give --hub-local, or both --hub-ssh and --hub-koyomi")
-    smtp = {}
-    for line in Path(args.smtp_env).read_text().splitlines():
-        key, sep, value = line.strip().partition("=")
-        if sep and key in SMTP_KEYS:
-            smtp[key] = value.strip().strip("'\"")
-    missing = [k for k in SMTP_KEYS if not smtp.get(k)]
-    if missing:
-        raise KoyomiError(f"{args.smtp_env} lacks {', '.join(missing)}")
-    cfg = {
-        "host": args.host,
-        "hub": hub_cfg,
-        "email": {
+    cfg = {"host": args.host, "hub": hub_cfg}
+    smtp_options = (args.smtp_env, args.email_from, args.email_to)
+    if any(option is not None for option in smtp_options):
+        if not all(smtp_options):
+            raise KoyomiError("give --smtp-env, --email-from and --email-to together")
+        smtp = {}
+        for line in Path(args.smtp_env).read_text().splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep and key in SMTP_KEYS:
+                smtp[key] = value.strip().strip("'\"")
+        missing = [k for k in SMTP_KEYS if not smtp.get(k)]
+        if missing:
+            raise KoyomiError(f"{args.smtp_env} lacks {', '.join(missing)}")
+        cfg["email"] = {
             "smtp_host": smtp["SMTP_HOST"],
             "smtp_port": int(smtp["SMTP_PORT"]),
             "smtp_user": smtp["SMTP_USER"],
             "smtp_password": smtp["SMTP_PASSWORD"],
             "from": args.email_from,
             "to": args.email_to,
-        },
-    }
+        }
     if cfg["hub"] == "local":
         home().mkdir(parents=True, exist_ok=True)
     call_hub(
@@ -1851,9 +1861,14 @@ def cmd_init(args) -> int:
     )
     write_json(config_path(), cfg, private=True)
     where = "this machine" if args.hub_local else args.hub_ssh
+    alerts = (
+        f"email alerts to {args.email_to}"
+        if "email" in cfg
+        else "email alerts disabled on this machine (SMTP is unconfigured)"
+    )
     print(
         f"initialized {args.host} ({'always on' if args.always_on else 'runs while awake'}); "
-        f"hub: {where}; alerts to {args.email_to}"
+        f"hub: {where}; {alerts}"
     )
     return 0
 
@@ -2036,8 +2051,21 @@ def print_table(rows: list[list[str]], headers: list[str]) -> None:
         print("  ".join(str(x).ljust(w) for x, w in zip(row, widths)).rstrip())
 
 
+def disabled_alert_messages(cfg: dict, hub_email_alerts: bool) -> list[str]:
+    messages = []
+    if not hub_email_alerts:
+        messages.append("email alerts disabled on the hub (SMTP is unconfigured)")
+    if cfg["hub"] != "local" and not cfg.get("email"):
+        messages.append("hub outage emails disabled on this host (SMTP is unconfigured)")
+    return messages
+
+
 def cmd_list(args) -> int:
-    jobs = hub("jobs")
+    cfg = load_config()
+    result = call_hub(cfg, "jobs", {})
+    for message in disabled_alert_messages(cfg, result["email_alerts"]):
+        print(f"koyomi: {message}", file=sys.stderr)
+    jobs = result["jobs"]
     if args.json:
         print(json.dumps(jobs, indent=2))
         return 0
@@ -2197,6 +2225,8 @@ def cmd_status(args) -> int:
                 f"  {j['id']} on {j['host']}: {lr['status']} ({lr.get('error')}) at "
                 f"{fmt_time(lr['started_at'])} -> koyomi logs {j['id']}"
             )
+    for message in disabled_alert_messages(cfg, snap["email_alerts"]):
+        print(f"alerts:    {message}")
     unsent = snap["unsent_alerts"]
     if unsent:
         print(
@@ -2278,7 +2308,7 @@ def cmd_fix(args) -> int:
     if args.ids:
         jobs = [hub("job", job_id=i) for i in args.ids]
     else:
-        jobs = [j for j in hub("jobs") if job_failing(j)]
+        jobs = [j for j in hub("jobs")["jobs"] if job_failing(j)]
         if not jobs:
             print("no failing jobs")
             return 0
@@ -3930,7 +3960,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     sp = sub.add_parser("init", help="set up this machine as a host")
-    sp.add_argument("host", help="this machine's host name, e.g. mac or emanator")
+    sp.add_argument("host", help="this machine's host name, e.g. laptop or server")
     sp.add_argument("--hub-local", action="store_true", help="this machine is the hub")
     sp.add_argument("--hub-ssh", metavar="DEST", help="ssh destination of the hub")
     sp.add_argument(
@@ -3939,16 +3969,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--always-on",
         action="store_true",
-        help="a server: late or missed slots and downtime raise alerts",
+        help="a server: alert on late or missed slots and downtime when SMTP is configured",
     )
     sp.add_argument(
         "--smtp-env",
-        required=True,
         metavar="FILE",
-        help="dotenv file with SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD",
+        help="enable email alerts from a dotenv file (SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD)",
     )
-    sp.add_argument("--email-from", required=True, metavar="ADDR")
-    sp.add_argument("--email-to", required=True, metavar="ADDR")
+    sp.add_argument("--email-from", metavar="ADDR", help="sender for --smtp-env")
+    sp.add_argument("--email-to", metavar="ADDR", help="recipient for --smtp-env")
     sp.set_defaults(func=cmd_init)
 
     def job_options(sp, adding: bool):
