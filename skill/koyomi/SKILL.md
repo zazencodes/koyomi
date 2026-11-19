@@ -1,24 +1,33 @@
 ---
 name: koyomi
-description: Schedule, inspect and debug jobs on Alex's machines (this Mac and the VPS emanator) with the `koyomi` CLI (cron-like recurring jobs, one-time jobs, run history, logs, failure alerts by email). Use when the user wants something to run later, on a schedule, every N minutes/hours/days, at a specific time, in the cloud, on the server/VPS or on this machine, wants a cloud task or remote job set up, or asks about scheduled/background jobs, cron, launchd or systemd timers, why a scheduled job failed, wants failed jobs fixed, was started by `koyomi fix`, or deploying/updating Koyomi itself.
+description: Schedule, inspect and debug jobs on one or more machines with the `koyomi` CLI (cron-like recurring jobs, one-time jobs, run history, logs, failure alerts by email). Use when the user wants something to run later, on a schedule, every N minutes/hours/days, at a specific time, in the cloud, on the server/VPS or on this machine, wants a cloud task or remote job set up, or asks about scheduled/background jobs, cron, launchd or systemd timers, why a scheduled job failed, wants failed jobs fixed, was started by `koyomi fix`, or deploying/updating Koyomi itself.
 ---
 
 # Koyomi
 
-Koyomi is a small job scheduler for a few machines. The hub (`emanator`) keeps every job, run
-record and log; every job is pinned to a host (`mac` or `emanator`) whose scheduler runs it. The
-`koyomi` CLI works the same on every machine and shows every job on every host. Always operate it
-through the CLI (on PATH).
+Koyomi is a small job scheduler for a few machines. The hub keeps every job, run record and
+log. Each job runs on its assigned host. Use the `koyomi` CLI to operate the scheduler.
 
-- `emanator` is always on: jobs run on schedule; a late or missed slot emails an alert.
-- `mac` runs jobs only while awake and online; a slot missed while asleep runs once on wake.
-- A failed, timed-out or interrupted run emails an alert, once per failure streak (quiet until the
-  job succeeds again). There is nothing to opt into.
+## Find the site's hosts
+
+Read `site-notes.md` in the Koyomi state directory when it exists. The directory is
+`${KOYOMI_HOME:-$HOME/.koyomi}`. The operator keeps this private file outside the repo and
+records host roles, SSH destinations, checkout paths, time zones and deployment procedures there.
+Keep credentials in the site's credential store.
+
+Use `koyomi status` to verify the hub, registered hosts, and service and alert status. For an existing
+job, use `koyomi show <id>` to confirm which host runs it. Host IDs may differ from SSH destinations.
+Get any access details missing from the site notes from the operator.
+
+- Always-on hosts run jobs on schedule. A late or missed slot can trigger an email alert.
+- When-awake hosts run jobs while awake and online. Missed slots catch up once by default.
+- With SMTP configured on the hub, a failed, timed-out or interrupted run can email an alert
+  once per failure streak. Other hosts use their own SMTP configuration to report hub outages.
 
 ## Workflow
 
-1. `koyomi status`: check the hosts are up and the local scheduler is running. If the local one is
-   not: `koyomi service start` (or `./install.sh` in the koyomi repo if the service is missing).
+1. Run `koyomi status`. Check that the target host is reporting and verify the local scheduler and
+   email alert status. Use `koyomi service start` if the local scheduler needs starting.
 2. Create the job with an explicit id, host, schedule, command and working directory.
 3. Test it right away with `koyomi run <id>`. It runs on the job's host, in the scheduler's
    environment, and streams the output here; the exit code is the job's. Prefer absolute paths.
@@ -29,18 +38,18 @@ through the CLI (on PATH).
 
 ```bash
 # recurring, standard 5-field cron (minute hour day month weekday) in the job's time zone
-koyomi add notes-backup --cron "30 2 * * *" --cwd ~/obsidian --cmd "git add -A && git commit -qm backup || true"
-koyomi add nightly-report --host emanator --tz America/Toronto --cron "0 6 * * *" \
-  --cwd /root/app --timeout 1h -- bin/report --quiet
-koyomi add sync --every 15m --cmd "./sync.sh" --cwd ~/pro/myproj --timeout 10m
+koyomi add notes-backup --cron "30 2 * * *" --cwd ~/work/notes --cmd "./backup.sh"
+koyomi add nightly-report --host server --tz Europe/Berlin --cron "0 6 * * *" \
+  --cwd /srv/report --timeout 1h -- bin/report --quiet
+koyomi add sync --every 15m --cmd "./sync.sh" --cwd ~/work/myproj --timeout 10m
 # one-time
 koyomi add later --in 2h --cmd "python3 cleanup.py"
-koyomi add remind --at "2026-09-20 14:00" --cmd 'osascript -e "display notification \"Call Sam\""'
+koyomi add remind --at "14:00" --cmd "echo reminder"
 ```
 
 - `--host` defaults to this machine. A job on another host needs `--cwd` as an absolute path on that host.
 - `--tz` (IANA name) sets the zone for `--cron` and `--at`; it defaults to this machine's zone.
-  emanator's clock is UTC, so pass `--tz America/Toronto` for Toronto times there.
+  Set it explicitly when the schedule should follow a particular zone.
 - Schedule: exactly one of `--cron`, `--every` (min 1m), `--at` ("YYYY-MM-DD HH:MM" or "HH:MM"), `--in`.
   `@hourly`, `@daily`, `@weekly`, `@monthly` and `@yearly` also work.
 - `--cmd "..."` runs through `/bin/sh -c`, so pipes, `&&` and redirects work. Or put argv after `--`.
@@ -49,33 +58,20 @@ koyomi add remind --at "2026-09-20 14:00" --cmd 'osascript -e "display notificat
   back. `--catchup skip`: drop slots that are more than 5 minutes late.
 - Job ids: letters, digits, `.`, `_` and `-`. Jobs get `KOYOMI_JOB`, `KOYOMI_RUN_ID` and `KOYOMI_HOST`.
 
-## Jobs on emanator (cloud tasks)
+## Jobs on a remote host
 
-Koyomi only stores and runs the command. Whatever it runs must already be on emanator, so set
-that up first, over `ssh emanator` (Ubuntu 24.04, user `root`):
+Prepare the job on its target host before scheduling it. Get the SSH destination, checkout path
+and deployment steps from the site notes or the operator.
 
-1. **Code:** clone the repo under `/root` (`gh` is logged in as `zazencodes` and is git's credential
-   helper): `ssh emanator 'cd /root && gh repo clone zazencodes/<repo>'`. Install its dependencies
-   there. Keep it current by having the job pull first (as `/root/agent-signals/bin/scheduled-run`
-   does), or by pulling by hand.
-2. **Secrets:** copy them as a file the job reads, e.g.
-   `scp .env emanator:/root/<repo>/.env && ssh emanator chmod 600 /root/<repo>/.env`. Don't pass
-   secrets with `--env`: they are stored in plain JSON on the hub and shown by `koyomi show`.
-3. **Check it by hand** with the scheduler's environment before scheduling:
-   `ssh emanator 'cd /root/<repo> && <command>'`.
-4. **Add it from any machine:** `koyomi add <id> --host emanator --cwd /root/<repo> --tz America/Toronto
-   --cron "..." --timeout <limit> -- <command>`, then `koyomi run <id>` to test it end to end.
+1. Put the code and dependencies on the target host.
+2. If the job needs secrets, install a private file on that host (mode 600) and have the job read it.
+   Koyomi stores `--env` values in plain JSON on the hub and displays them in `koyomi show`.
+3. Check the command on the host using the scheduler's working directory, shell and PATH.
+4. Add the job with `--host <host-id>`, an absolute `--cwd` on that host, the intended time zone
+   and an explicit timeout. Use `koyomi run <id>` for an end-to-end test when the command is safe to run.
 
-What jobs on emanator get:
-
-- User `root`, `HOME=/root`, and the PATH baked into `/etc/systemd/system/koyomi.service`: it has
-  `/root/.local/bin` (uv, koyomi), `/usr/local/bin` (npm globals such as `codex`) and `/usr/bin`
-  (node 24, git, gh, python3.12). Nothing from `~/.bashrc` is loaded.
-- `--cmd` runs with `/bin/sh`, which is **dash** there: no bash-isms (`source`, `[[ ]]`, arrays).
-  Put anything non-trivial in a script with a `#!/usr/bin/env bash` line and run that.
-- `--cwd` can't be checked from the Mac; a wrong one fails the first run ("could not start command").
-- Always set `--timeout`: an always-on host has no one watching it.
-- Restarting or reinstalling Koyomi does not kill runs in progress.
+The service captures its install-time `HOME` and `PATH` and `--cmd` runs through `/bin/sh`.
+Use a script with the appropriate shebang when the command needs a different shell.
 
 ## Managing jobs
 
@@ -94,7 +90,7 @@ koyomi stop <id>                # stop the active run (recorded as "stopped", no
 ## Debugging
 
 ```bash
-koyomi status                   # hosts, scheduler health, failing jobs, unsent alerts
+koyomi status                   # hosts, scheduler health, failing jobs, email alert status
 koyomi history [<id>] [--failed] [-n 50] [--json]
 koyomi logs <id>                # output of latest run, lines prefixed with local HH:MM:SS (--run RUN_ID, -n 0 = all)
 koyomi logs --daemon            # scheduling events from every host: starts, skips, catch-ups, alerts
@@ -107,10 +103,10 @@ Run statuses: `queued`, `running`, `success`, `failed` (non-zero exit), `timeout
 was still going, or the slot was missed with catchup=skip). A job never overlaps itself.
 
 Common failures: `command not found` (use an absolute path, or check the PATH baked into the
-service: `~/Library/LaunchAgents/local.koyomi.scheduler.plist` on the Mac,
-`/etc/systemd/system/koyomi.service` on emanator), a wrong `cwd`, or scripts that expect an
+service: `~/Library/LaunchAgents/local.koyomi.scheduler.plist` on macOS,
+`/etc/systemd/system/koyomi.service` on Linux), a wrong `cwd`, or scripts that expect an
 interactive shell. Reproduce with `koyomi run <id>`. Scheduler process errors are in
-`~/.koyomi/launchd.log` (Mac) and `journalctl -u koyomi` (emanator).
+`~/.koyomi/launchd.log` (macOS) and `journalctl -u koyomi` (Linux).
 
 ## Fixing failed jobs
 
@@ -124,9 +120,8 @@ you the orchestrator.
    some?), `koyomi logs <id> -n 0`, and `koyomi logs <id> --run <RUN_ID>` to compare an earlier
    success. For `interrupted` or scheduling problems, `koyomi logs --daemon`.
 2. Find the cause where the job runs. A job on this host: work in its `cwd`. A job on another host:
-   `ssh <host>` (`ssh emanator`). emanator can't reach the Mac, so for a Mac job seen from
-   emanator, report what the logs show and stop. Reproduce with the scheduler's environment (the
-   service's PATH, `/bin/sh`), not your interactive shell.
+   use the SSH destination in the site notes. If the host is inaccessible, report what the logs show
+   and where the fix needs to be made. Reproduce with the scheduler's PATH and `/bin/sh`.
 3. Fix the root cause: the job's code, its definition (`koyomi update`), or its environment
    (a missing tool, secret or login). A one-off cause (network blip, an `interrupted` run after a
    reboot or sleep) needs no fix; say so.
@@ -157,22 +152,10 @@ you fix. Helpers and single-job fixers use the agent's defaults.
 
 ## Koyomi itself
 
-- **Source:** `~/pro/koyomi` (github.com/zazencodes/koyomi). Its `AGENTS.md` is the full guide
-  for changing and deploying it; read it before touching Koyomi's code or services.
-- **Hub:** emanator holds all state in `/root/.koyomi/`. The scheduler is the systemd unit `koyomi`, and the
-  installed checkout is `/root/koyomi`, an rsync copy rather than a git clone.
-- **Mac:** a host that reaches the hub with `ssh emanator /root/.local/bin/koyomi _rpc`; its
-  `~/.koyomi/config.json` holds that command. If every command fails with "cannot reach the hub",
-  check `ssh emanator true` first.
-- **Deploying a change** (hub first; both machines must run the same version, or every call fails
-  with "version mismatch"):
-  ```bash
-  rsync -a --delete --exclude .git --exclude .venv --exclude build --exclude '*.egg-info' \
-    --exclude __pycache__ --exclude .ruff_cache ~/pro/koyomi/ emanator:/root/koyomi/
-  ssh emanator 'cd /root/koyomi && PATH=/root/.local/bin:$PATH ./install.sh'
-  cd ~/pro/koyomi && ./install.sh
-  ```
-- **A new host:** see "Install" in the repo's `README.md` (`uv tool install .`, `koyomi init`, `./install.sh`).
+Read the source checkout's `AGENTS.md` before editing Koyomi and its `README.md` before
+installing it on a new host. Consult the private site notes for checkout locations and deployment
+steps. When deploying, update the hub first, then every other host. The CLI, schedulers and hub
+must all run the same version.
 
 ## Rules
 

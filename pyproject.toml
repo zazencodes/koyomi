@@ -3,6 +3,7 @@ name = "koyomi"
 version = "0.4.0"
 description = "Small job scheduler for a few machines, with plain-JSON state on a hub"
 readme = "README.md"
+license = "GPL-3.0-only"
 requires-python = ">=3.10"
 dependencies = []
 
@@ -10,7 +11,7 @@ dependencies = []
 koyomi = "koyomi:main"
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

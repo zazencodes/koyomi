@@ -8,19 +8,19 @@
 ## Repo Shape
 
 - `koyomi.py`: the whole thing. Sections, top to bottom: cron parser; hub state and operations (`op_*`, registered in `HUB_OPS`), which run only on the hub; hub access (`hub()` / `call_hub()`, the `_rpc` server); email alerts; the runner (`execute`, hidden `_exec` subcommand); the host daemon (`host_tick`, `daemon_main`); launchd/systemd management (`service`); CLI commands; TUI.
-- `skill/koyomi/SKILL.md`: global agent skill. It is an external skill of the `~/agents` registry (`EXTERNAL_SKILLS` in `~/agents/skills/sync_skills.py`), which symlinks this folder into `~/.agents/skills`, `~/.claude/skills` and Gemini's skills, so edits go live immediately.
+- `skill/koyomi/SKILL.md`: agent skill for scheduling, debugging and operating Koyomi.
 - `install.sh`: `uv tool install --reinstall .` + `koyomi service install`.
 - `tests/test_koyomi.py`: unittest suite.
 
 ## Architecture
 
-- The hub (here: `emanator`, `/root/koyomi`) owns all state. On the hub, `hub()` calls `op_*` in-process; elsewhere it runs `config.json`'s `hub.command` (`ssh … emanator /root/.local/bin/koyomi _rpc`) with a JSON request on stdin. Both sides check `VERSION`, so bump it when an op's arguments or results change, and reinstall every machine.
+- The hub owns all state. On the hub, `hub()` calls `op_*` in-process; elsewhere it runs `config.json`'s `hub.command` (`ssh … server /path/to/koyomi _rpc`) with a JSON request on stdin. Both sides check `VERSION`, so bump it when an op's arguments or results change, and reinstall every machine.
 - Hosts hold no job state: `config.json`, `daemon.json`, `spool/<run_id>.log` (output not yet uploaded).
 
 ## Workflow
 
-- The installed CLI/daemon is a **copy** in the uv tool venv, not this checkout. After changing `koyomi.py`, run `./install.sh` on every machine (on the hub first): `rsync`/`git pull` the checkout to `emanator:/root/koyomi`, then `ssh emanator 'cd /root/koyomi && ./install.sh'`, then `./install.sh` here.
-- After every change to `koyomi.py`, run `./install.sh` on this Mac without being asked, so `koyomi` (including `koyomi tui`) runs the new code. A change that touches the hub (ops, `VERSION`, daemon) still goes to the hub first, as above.
+- The installed CLI and daemon run from the uv tool venv. When deploying changes, update the hub checkout and run `./install.sh` there first, then update and install on every other host.
+- Keep site-specific deployment instructions in `${KOYOMI_HOME:-$HOME/.koyomi}/site-notes.md` outside the checkout. The agent skill reads this file when present.
 - Set `KOYOMI_HOME=/some/tmp/dir` with a `config.json` whose `hub` is `"local"` to experiment without touching real state.
 - `service install` bakes the current shell's `PATH` (and `HOME`) into the plist/unit; scheduled jobs use that PATH.
 
@@ -35,5 +35,5 @@
 
 ## Validation
 
-- `python3 -m unittest discover -s tests -v` (~8s; spawns real short-lived processes, including `_rpc` servers).
-- For scheduler changes, also check live: reinstall hub and Mac, add a `--cron "* * * * *"` job on each host, confirm with `koyomi history` / `koyomi logs --daemon`, then delete them.
+- `uv run --no-project --python 3.12 python -m unittest discover -s tests -v` (~8s; spawns real short-lived processes, including `_rpc` servers).
+- For scheduler changes, use a test hub and test host to check the service end to end. Install Koyomi on both, add a `--cron "* * * * *"` job on each host, confirm with `koyomi history` / `koyomi logs --daemon`, then delete them.

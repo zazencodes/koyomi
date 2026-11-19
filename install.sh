@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install (or reinstall) Koyomi on this machine: CLI via uv tool and scheduler service
 # (launchd agent on macOS, systemd unit on Linux). A new machine runs `koyomi init` first
-# (see README.md). The agent skill is linked by the ~/agents skills registry, not here.
+# (see README.md).
 set -eu
 cd "$(dirname "$0")"
 
