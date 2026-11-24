@@ -20,7 +20,7 @@
 ## Workflow
 
 - The installed CLI and daemon run from the uv tool venv. When deploying changes, update the hub checkout and run `./install.sh` there first, then update and install on every other host.
-- Keep site-specific deployment instructions in `${KOYOMI_HOME:-$HOME/.koyomi}/site-notes.md` outside the checkout. The agent skill reads this file when present.
+- Keep site-specific deployment instructions in `${KOYOMI_HOME:-$HOME/.koyomi}/site-notes.md` outside the checkout. Read it, when present, before deploying; the agent skill reads it too.
 - Set `KOYOMI_HOME=/some/tmp/dir` with a `config.json` whose `hub` is `"local"` to experiment without touching real state.
 - `service install` bakes the current shell's `PATH` (and `HOME`) into the plist/unit; scheduled jobs use that PATH.
 
