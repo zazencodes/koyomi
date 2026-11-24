@@ -993,6 +993,12 @@ class FixTests(HubCase):
         argv = k.shlex.split(self.tmux_calls()[-2][-1])
         self.assertEqual(argv[:-1], k.FIX_AGENTS["claude"])  # a helper: defaults
 
+    def test_disabled_jobs_are_not_failing(self):
+        self.make_failing("off")
+        self.cli("disable", "off")
+        self.assertEqual(self.cli("fix"), 0)
+        self.assertEqual(self.tmux_calls(), [])
+
     def test_nothing_failing_starts_nothing(self):
         self.add("fine", "--every", "1h", "--cmd", "true")
         self.assertEqual(self.cli("fix"), 0)

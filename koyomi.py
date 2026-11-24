@@ -2255,7 +2255,10 @@ ORCHESTRATOR_FLAGS = {
 
 
 def job_failing(job: dict) -> bool:
-    return (job.get("last_run") or {}).get("status") in ALERT_STATES
+    """An enabled job whose last run failed; a disabled job is not failing."""
+    return bool(job.get("enabled")) and (job.get("last_run") or {}).get(
+        "status"
+    ) in ALERT_STATES
 
 
 def installed_fix_agent() -> str:
@@ -3145,10 +3148,7 @@ class TuiApp:
         self.put(0, host_x, hosts[:-1], width - host_x - 2)
 
         active = sum(bool(j.get("running")) for j in self.all_jobs)
-        failing = sum(
-            (j.get("last_run") or {}).get("status") in FAILURE_STATES
-            for j in self.all_jobs
-        )
+        failing = sum(job_failing(j) for j in self.all_jobs)
         total = len(self.all_jobs)
         enabled = sum(bool(j.get("enabled")) for j in self.all_jobs)
         parts = [
