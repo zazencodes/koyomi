@@ -134,21 +134,22 @@ it does not extrapolate throughput. Short terminals show the completion count.
 
 | key | action |
 | --- | --- |
-| `j`/`k`, `↑`/`↓`, `g`, PgUp/PgDn | move the selection |
+| `j`/`k`, `↑`/`↓`, `g`/`G`, PgUp/PgDn | move the selection |
 | `Enter` | open the job page |
 | `h`/`l`, `←`/`→` | select an older / newer recent run |
 | `e` | enable / disable (an active run keeps going) |
 | `r` | run now on the job's host (asks first) |
 | `x` | stop the active run (asks first) |
 | `d` | delete the job and its history (asks first) |
-| `/` | search id, host, description and command; `n` for the next match; `Esc` clears |
+| `D` | scheduler log of every host |
+| `/` | search id, host, description and command; `n`/`N` next/previous match; `Esc` clears |
 | `s` | sort by id, host, next run, or state |
 | `?` | all keys |
 | `q` | close what is open, or quit |
 
 The job page shows the job's command, schedule and options, its runs (newest first) and the tail of the picked run's log, live while it runs. `j`/`k` pick a run, `Enter` downloads its whole log and opens it, `e`/`r`/`x` work as on the list, and `Esc` goes back.
 
-Inside a log: `j`/`k` scroll, `ctrl+d`/`ctrl+u` page, `g` jumps to the beginning, `f` toggles live follow, and `/` searches. Press `n` for the next match.
+Inside a log: `j`/`k` scroll, `Ctrl-D`/`Ctrl-U` page, `g`/`G` jump, `f` toggles live follow, `/` searches (`n`/`N` step through the matches, as in vim; an uppercase letter makes it case-sensitive).
 
 Every output line is stamped with the time it was written; the dashboard and `koyomi logs` show it in local time. Logs from before stamping show without times.
 
