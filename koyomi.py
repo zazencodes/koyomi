@@ -68,7 +68,7 @@ LOG_CHUNK = 1_000_000  # max bytes uploaded per sync
 MIN_INTERVAL = 60
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ACTIVE_STATES = {"queued", "running"}
-ALERT_STATES = {"failed", "timeout", "interrupted"}  # also FAILURE_STATES in the UI
+ALERT_STATES = {"failed", "timeout", "interrupted"}
 SMTP_KEYS = ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD")
 
 
@@ -2360,7 +2360,6 @@ def cmd_fix(args) -> int:
 
 # ---------------------------------------------------------------- terminal UI
 
-FAILURE_STATES = ALERT_STATES
 # 256-color palette; -1 is the terminal's own foreground. A style name ending
 # in "*" is drawn bold. Terminals without 256 colors get plain attributes.
 PALETTE = {
