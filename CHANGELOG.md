@@ -4,7 +4,7 @@ All notable changes to Koyomi are documented here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-11-23
+## [0.4.0] - 2026-11-24
 
 ### Added
 
