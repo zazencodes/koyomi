@@ -911,73 +911,101 @@ class ServiceAndUiTests(HubCase):
 
 
 class FixTests(HubCase):
-    """`koyomi fix` against a fake tmux that records its calls."""
+    """`koyomi fix` with the foreground process launch intercepted."""
 
     def setUp(self):
         super().setUp()
-        bin_dir = self.root / "bin"
-        bin_dir.mkdir()
-        self.calls = self.root / "tmux.calls"
-        for name, script in (
-            (
-                "tmux",
-                f'printf "%s\\0" "$@" >> {self.calls}; printf "\\n" >> {self.calls}; echo %7',
+        self.launch_dir = (self.root / "launch  directory").resolve()
+        self.launch_dir.mkdir()
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.launch_dir)
+        self.launches = []
+        which = mock.patch.object(
+            k.shutil,
+            "which",
+            side_effect=lambda name: "/fake/bin/codex" if name == "codex" else None,
+        )
+        launch = mock.patch.object(
+            os,
+            "execvp",
+            side_effect=lambda program, argv: self.launches.append(
+                (Path.cwd(), program, argv)
             ),
-            ("codex", "exit 0"),
-        ):
-            (bin_dir / name).write_text(f"#!/bin/sh\n{script}\n")
-            (bin_dir / name).chmod(0o755)
-        env = {
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "TMUX": "/tmp/t,1,0",
-            "TMUX_PANE": "%1",
-        }
-        patcher = mock.patch.dict(os.environ, env)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        )
+        for patcher in (which, launch):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
-    def tmux_calls(self):
-        if not self.calls.exists():
-            return []
-        return [line.split("\0")[:-1] for line in self.calls.read_text().splitlines()]
+    def fix_argv(self, *args, cwd=None):
+        before = len(self.launches)
+        self.assertEqual(self.cli("fix", *args), 0)
+        self.assertEqual(len(self.launches), before + 1)
+        actual_cwd, program, argv = self.launches[-1]
+        self.assertEqual(actual_cwd, cwd or self.launch_dir)
+        self.assertEqual(program, argv[0])
+        return argv
 
     def make_failing(self, job_id):
         self.add(job_id, "--every", "1h", "--cwd", str(self.root), "--cmd", "exit 3")
         self.set_next_run(job_id, k.now())
         self.tick()
 
-    def test_one_failing_job_gets_an_agent_in_its_directory(self):
+    def test_one_failing_job_gets_an_agent_in_the_callers_directory(self):
         self.add("fine", "--every", "1h", "--cmd", "true")
         self.make_failing("bad")
-        self.assertEqual(self.cli("fix", "-m", "check\nthe  token"), 0)
-        split, layout, title, keys, enter = self.tmux_calls()
-        self.assertEqual(
-            split[:5], ["split-window", "-t", "%1", "-c", str(self.root.resolve())]
-        )
-        self.assertEqual(title, ["select-pane", "-t", "%7", "-T", "fix:bad"])
-        argv = k.shlex.split(keys[-1])
+        argv = self.fix_argv("-m", "check\nthe  token")
         self.assertEqual(argv[:2], k.FIX_AGENTS["codex"])  # the only one installed
         self.assertIn("Fix the Koyomi job bad on box (last run", argv[-1])
         self.assertIn('"Fixing failed jobs"', argv[-1])
         self.assertTrue(argv[-1].endswith("Guidance from the user: check the token"))
-        self.assertEqual(enter, ["send-keys", "-t", "%7", "Enter"])
+
+    def test_project_fix_uses_the_worktree_root_to_scope_jobs(self):
+        (self.launch_dir / ".git").write_text("gitdir: /worktrees/project\n")
+        nested = self.launch_dir / "worker"
+        nested.mkdir()
+        os.chdir(nested)
+        self.add("worker", "--every", "1h", "--cwd", str(nested), "--cmd", "true")
+        self.add(
+            "cleanup", "--every", "1h", "--cwd", str(self.launch_dir), "--cmd", "true"
+        )
+        k.op_register_host("remote", True, sys.platform)
+        self.add(
+            "remote-job",
+            "--host", "remote",
+            "--every", "1h",
+            "--cwd", str(nested),
+            "--cmd", "true",
+        )
+        self.make_failing("unrelated")
+
+        argv = self.fix_argv(cwd=nested)
+        self.assertEqual(argv[:-1], k.FIX_AGENTS["codex"])
+        self.assertIn(str(self.launch_dir), argv[-1])
+        self.assertIn("AGENTS.md", argv[-1])
+        self.assertIn("cleanup, worker", argv[-1])
+        self.assertNotIn("unrelated", argv[-1])
+        self.assertNotIn("remote-job", argv[-1])
+
+        prompt = self.fix_argv("unrelated", cwd=nested)[-1]
+        self.assertIn("Fix the Koyomi job unrelated", prompt)
+
+    def test_project_fix_starts_even_without_jobs(self):
+        (self.launch_dir / ".git").mkdir()
+        prompt = self.fix_argv()[-1]
+        self.assertIn('"Fixing a project"', prompt)
 
     def test_several_jobs_get_an_orchestrator(self):
         self.make_failing("a")
         self.make_failing("b")
-        self.assertEqual(self.cli("fix", "--agent", "opencode"), 0)
-        keys = self.tmux_calls()[3]
-        argv = k.shlex.split(keys[-1])
+        argv = self.fix_argv("--agent", "opencode")
         self.assertEqual(argv[:-1], ["opencode", "--auto", "--prompt"])
         self.assertIn("orchestrator for these Koyomi jobs: a on box", argv[-1])
         self.assertIn("ask the user which plan", argv[-1])
-        self.assertIn("`koyomi fix --agent opencode <job>`", argv[-1])
 
     def test_orchestrator_runs_on_a_low_effort_model(self):
         self.make_failing("a")
         self.make_failing("b")
-        self.assertEqual(self.cli("fix", "--agent", "claude"), 0)
-        argv = k.shlex.split(self.tmux_calls()[3][-1])
+        argv = self.fix_argv("--agent", "claude")
         self.assertEqual(
             argv[:-1],
             [
@@ -989,20 +1017,19 @@ class FixTests(HubCase):
                 "--dangerously-skip-permissions",
             ],
         )
-        self.assertEqual(self.cli("fix", "--agent", "claude", "a"), 0)
-        argv = k.shlex.split(self.tmux_calls()[-2][-1])
-        self.assertEqual(argv[:-1], k.FIX_AGENTS["claude"])  # a helper: defaults
+        argv = self.fix_argv("--agent", "claude", "a")
+        self.assertEqual(argv[:-1], k.FIX_AGENTS["claude"])
 
     def test_disabled_jobs_are_not_failing(self):
         self.make_failing("off")
         self.cli("disable", "off")
         self.assertEqual(self.cli("fix"), 0)
-        self.assertEqual(self.tmux_calls(), [])
+        self.assertEqual(self.launches, [])
 
     def test_nothing_failing_starts_nothing(self):
         self.add("fine", "--every", "1h", "--cmd", "true")
         self.assertEqual(self.cli("fix"), 0)
-        self.assertEqual(self.tmux_calls(), [])
+        self.assertEqual(self.launches, [])
         self.assertEqual(self.cli("fix", "nope"), 1)
 
 

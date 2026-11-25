@@ -95,7 +95,7 @@ koyomi history [<id>] [--failed] [-n 50] [--json]
 koyomi logs <id>                # output of latest run, lines prefixed with local HH:MM:SS (--run RUN_ID, -n 0 = all)
 koyomi logs --daemon            # scheduling events from every host: starts, skips, catch-ups, alerts
 koyomi tui                      # interactive dashboard (for the user, not for agents)
-koyomi fix [ID...] [-a claude|codex|pi|opencode] [-m "guidance"]   # agent(s) in tmux fix failing jobs
+koyomi fix [ID...] [-a claude|codex|pi|opencode] [-m "guidance"]   # fix this project or target jobs
 ```
 
 Run statuses: `queued`, `running`, `success`, `failed` (non-zero exit), `timeout`, `stopped`
@@ -108,11 +108,23 @@ service: `~/Library/LaunchAgents/local.koyomi.scheduler.plist` on macOS,
 interactive shell. Reproduce with `koyomi run <id>`. Scheduler process errors are in
 `~/.koyomi/launchd.log` (macOS) and `journalctl -u koyomi` (Linux).
 
+## Fixing a project
+
+In a Git checkout, bare `koyomi fix` starts an agent in the caller's terminal and directory. It
+gives the agent the repository root and the local Koyomi jobs with directories inside the checkout.
+
+1. Read the repository's `AGENTS.md` first. Follow its instructions and start diagnosing directly.
+2. Use `koyomi show <id>`, `koyomi history <id> -n 20`, and `koyomi logs <id> --run <RUN_ID>` for
+   the project's jobs. Check for application errors even when a run exits successfully.
+3. Trace the evidence through the project's code, logs and checks. Investigate the project even
+   when no jobs are listed. Fix the cause and verify with the project's checks. Apply the rerun
+   guidance below before starting any scheduled command.
+
 ## Fixing failed jobs
 
-`koyomi fix` starts a coding agent in a new tmux pane, in full-auto mode, with a prompt that names
-the jobs and points here. A prompt for one job makes you its fixer. A prompt listing several makes
-you the orchestrator.
+`koyomi fix <id>...` targets the named jobs. Outside a Git checkout, bare `koyomi fix` targets all
+failing jobs. The agent starts in the caller's terminal and directory. A prompt for one job makes
+you its fixer. A prompt to orchestrate several jobs makes you their orchestrator.
 
 **Fixer**, for each job:
 
@@ -134,21 +146,12 @@ you the orchestrator.
 
 **Orchestrator:** you run at low effort (Claude: `claude-opus-5-5`, `--effort low`; Codex:
 `gpt-6.1-sol`, `model_reasoning_effort="low"`; pi and opencode: their defaults), so plan before
-you fix. Helpers and single-job fixers use the agent's defaults.
+you fix. Project and single-job fixers use the agent's defaults.
 
 1. Triage every job (fixer steps 1-2, briefly). Jobs often share a cause (an expired login, a
    down host, a broken PATH) that one fix covers. Judge how hard each job is to fix.
-2. Ask the user which plan to follow, then wait for the answer before changing anything. Offer
-   two or three plans, each naming who fixes which job, for example: you fix every job; you fix
-   the quick ones and helpers take the rest; one helper per job. Recommend one. When the fixes
-   are simple, recommend fixing everything yourself; a helper is only worth it for a job that
-   needs real work in its own repo.
-3. Follow the chosen plan. A helper is
-   `koyomi fix --agent <your agent> <id> -m "<what you found and what to try>"`: it opens a pane
-   next to yours with an agent in that job's directory, and prints the pane id. One helper per
-   job. Watch helpers with `tmux capture-pane -p -t <pane> | tail -40`; a helper that is done
-   waits at its prompt.
-4. End with one summary of every job for the user.
+2. Propose which jobs to fix and in what order. Wait for the user's answer before changing anything.
+3. Follow the agreed plan and report the outcome for each job.
 
 ## Koyomi itself
 

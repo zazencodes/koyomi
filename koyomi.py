@@ -2278,84 +2278,66 @@ def describe_failure(job: dict) -> str:
     )
 
 
-def fix_prompt(agent: str, host: str, jobs: list[dict], message: str | None) -> str:
-    """One line: it is typed into a shell, where a newline would submit early."""
+def fix_prompt(
+    host: str, jobs: list[dict], message: str | None, project: Path | None
+) -> str:
     skill = 'Load the koyomi skill and follow its "Fixing failed jobs" section.'
-    if len(jobs) == 1:
+    if project is not None:
+        prompt = (
+            f"Find and fix errors in the project rooted at {str(project)!r}. "
+            "Start by reading AGENTS.md at the repository root if it exists. "
+            'Load the koyomi skill and follow its "Fixing a project" section. '
+            "Start investigating directly and verify any fix with the project's checks."
+        )
+        if jobs:
+            job_ids = ", ".join(job["id"] for job in jobs)
+            prompt += f" Inspect the history and logs for these Koyomi jobs: {job_ids}."
+    elif len(jobs) == 1:
         prompt = f"Fix the Koyomi job {describe_failure(jobs[0])}. {skill}"
     else:
         prompt = (
             "You are the orchestrator for these Koyomi jobs: "
             f"{'; '.join(describe_failure(j) for j in jobs)}. {skill} "
-            "Triage first, then ask the user which plan to follow before fixing anything. "
-            f"A helper agent is `koyomi fix --agent {agent} <job>`."
+            "Triage first, then ask the user which plan to follow before fixing anything."
         )
     prompt += f" You are on host {host}."
     if message:
-        prompt += f" Guidance from the user: {message}"
-    return " ".join(prompt.split())
-
-
-def tmux(*args: str) -> str:
-    out = subprocess.run(["tmux", *args], capture_output=True, text=True)
-    if out.returncode:
-        raise KoyomiError(f"tmux {args[0]} failed: {out.stderr.strip()}")
-    return out.stdout.strip()
+        prompt += f" Guidance from the user: {' '.join(message.split())}"
+    return " ".join(prompt.splitlines())
 
 
 def cmd_fix(args) -> int:
-    if not shutil.which("tmux"):
-        raise KoyomiError("koyomi fix needs tmux")
     cfg = load_config()
     agent = args.agent or installed_fix_agent()
+    cwd = Path.cwd()
+    project = None
     if args.ids:
         jobs = [hub("job", job_id=i) for i in args.ids]
     else:
-        jobs = [j for j in hub("jobs")["jobs"] if job_failing(j)]
-        if not jobs:
-            print("no failing jobs")
-            return 0
-    # a single job on this host is fixed in its own directory
-    cwd = str(Path.home())
-    if (
-        len(jobs) == 1
-        and jobs[0]["host"] == cfg["host"]
-        and Path(jobs[0]["cwd"]).is_dir()
-    ):
-        cwd = jobs[0]["cwd"]
-    argv = FIX_AGENTS[agent]
-    if len(jobs) == 1:
-        title = f"fix:{jobs[0]['id']}"
-    else:
-        title = "fix:orchestrator"
-        argv = argv[:1] + ORCHESTRATOR_FLAGS.get(agent, []) + argv[1:]
-    command = shlex.join(argv + [fix_prompt(agent, cfg["host"], jobs, args.message)])
-    inside = "TMUX" in os.environ
-    if inside:
-        pane = tmux(
-            "split-window",
-            "-t",
-            os.environ["TMUX_PANE"],
-            "-c",
-            cwd,
-            "-P",
-            "-F",
-            "#{pane_id}",
+        project = next(
+            (path for path in (cwd, *cwd.parents) if (path / ".git").exists()), None
         )
-        tmux("select-layout", "-t", pane, "tiled")
-    else:
-        pane = tmux("new-session", "-d", "-c", cwd, "-P", "-F", "#{pane_id}")
-    tmux("select-pane", "-t", pane, "-T", title)
-    # typed into the pane's login shell, so the user's aliases and secrets apply
-    tmux("send-keys", "-t", pane, "-l", command)
-    tmux("send-keys", "-t", pane, "Enter")
-    print(f"{agent} started in tmux pane {pane} ({title}, {cwd})")
-    if not inside:
-        if not sys.stdout.isatty():
-            print(f"attach with: tmux attach -t {pane}")
-            return 0
-        os.execvp("tmux", ["tmux", "attach", "-t", pane])
-    return 0
+        all_jobs = hub("jobs")["jobs"]
+        if project is not None:
+            jobs = [
+                job
+                for job in all_jobs
+                if job["host"] == cfg["host"]
+                and Path(job["cwd"]).resolve().is_relative_to(project)
+            ]
+        else:
+            jobs = [job for job in all_jobs if job_failing(job)]
+            if not jobs:
+                print("no failing jobs")
+                return 0
+    argv = FIX_AGENTS[agent]
+    if project is None and len(jobs) > 1:
+        argv = argv[:1] + ORCHESTRATOR_FLAGS.get(agent, []) + argv[1:]
+    prompt = fix_prompt(cfg["host"], jobs, args.message, project)
+    try:
+        os.execvp(argv[0], [*argv, prompt])
+    except OSError as exc:
+        raise KoyomiError(f"could not start {agent}: {exc}") from exc
 
 
 # ---------------------------------------------------------------- terminal UI
@@ -4094,9 +4076,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "fix",
-        help="start a coding agent in tmux to fix failing jobs (several: an orchestrator)",
+        help="start a coding agent here to fix this project or failing jobs",
+        description=(
+            "Start a coding agent in this terminal and directory. With no job IDs, "
+            "fix the current Git project or target all failing jobs outside Git."
+        ),
     )
-    sp.add_argument("ids", nargs="*", metavar="ID", help="jobs (default: all failing)")
+    sp.add_argument("ids", nargs="*", metavar="ID", help="Koyomi jobs to fix")
     sp.add_argument(
         "-a",
         "--agent",
