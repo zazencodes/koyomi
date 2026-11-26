@@ -14,6 +14,8 @@
   <a href="https://zazencodes.com/"><img src="https://img.shields.io/badge/made%20by-ZazenCodes-black" alt="Made by ZazenCodes"></a>
 </p>
 
+> **Part of [zstack](https://github.com/zazencodes/zstack)**, the agentic system I use to run ZazenCodes.
+
 A small job scheduler for a few machines. One Python file (stdlib only), plain JSON state, a launchd agent on macOS and a systemd service on Linux.
 
 One machine is the **hub**: it holds every job, run record and log in `~/.koyomi/`. Every job is pinned to a **host** that runs it. Each host runs a scheduler that asks the hub for its due runs, runs them, and streams their output back. Other machines reach the hub with `ssh <hub> koyomi _rpc`, so the CLI and the dashboard show and control every job on every host from any machine.
